@@ -168,6 +168,12 @@ v1 build orchestration is implemented and working: `forge run`,
 host. Compiler dispatch, manifest parsing, and per-invocation `target/logs`
 are in place. Dependency fetching and the TCP runner pool are planned next.
 
+## Author note 
+
+  I'm gonna keep it real. I don't have a very good 
+understanding of C so i vibe-coded as much of a decent skeleton as i can while I'm learning C deeper.
+This is very much a work in progress and I hope u guys are patient with me. :)
+
 ## License
 
 TBD.
