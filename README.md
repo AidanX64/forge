@@ -29,6 +29,80 @@ Implementation language rules for Forge itself:
 (Rust was considered for implementing Forge itself, but dropped in favor
 of raw C.)
 
+## Building from source
+
+Forge is written in C11 and builds itself with `gcc` or `clang` — no other
+toolchain required. The only dependency is a C compiler.
+
+### Make (Linux / macOS / Windows with GNU make)
+
+```sh
+make                    # builds target/forge
+make test               # builds and runs `forge --help`
+```
+
+### Direct (no make)
+
+```sh
+# Linux / macOS
+gcc -Wall -Wextra -Werror -std=c11 -Iinclude src/*.c -o target/forge
+
+# Windows
+gcc -Wall -Wextra -Werror -std=c11 -Iinclude src/*.c -o target\forge.exe
+```
+
+## Installation
+
+Forge installs to a user-level bin directory — no `sudo` needed.
+
+### Windows
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+Installs to `%USERPROFILE%\bin\forge.exe` and prints the exact `PATH` command
+to run (persist it with `setx` or the `SetEnvironmentVariable` snippet it
+shows).
+
+### Linux / macOS
+
+```sh
+sh scripts/install.sh     # or: chmod +x scripts/install.sh && ./scripts/install.sh
+```
+
+Installs to `~/.local/bin/forge` (override with `XDG_BIN_HOME`) and prints the
+`export PATH=...` line to add to your shell profile.
+
+### Via make
+
+```sh
+make install            # PREFIX defaults to ~/.local/bin (Linux/macOS)
+make uninstall          # removes it again
+```
+
+After installing, add the bin directory to `PATH` and verify:
+
+```sh
+forge --help
+```
+
+## Quickstart
+
+```sh
+cd <your-project>       # any dir with a Forge.toml + src/
+forge run               # build (debug) and run
+forge run --release     # build (release) and run
+forge debug             # build, then launch a debugger
+```
+
+Try it immediately against the bundled fixture:
+
+```sh
+cd test
+forge run --release     # prints "Hello world!"
+```
+
 ## Features
 
 ### Build orchestration
@@ -79,8 +153,10 @@ build system first; the "package manager" ambitions come later.
 
 ## Status
 
-Early / conceptual — design is set, implementation in raw C is
-in progress.
+v1 build orchestration is implemented and working: `forge run`,
+`forge run --release`, and `forge debug` build, link, log, and execute on the
+host. Compiler dispatch, manifest parsing, and per-invocation `target/logs`
+are in place. Dependency fetching and the TCP runner pool are planned next.
 
 ## License
 
