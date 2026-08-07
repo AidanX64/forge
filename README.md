@@ -57,8 +57,17 @@ Forge installs to a user-level bin directory — no `sudo` needed.
 
 ### Windows
 
+Easiest (builds with the bundled `install.ps1`):
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\install.ps1
+```
+
+Or with GNU make (e.g. MSYS2 / Git Bash):
+
+```sh
+make                    # builds target\forge.exe
+make install            # copies it to %USERPROFILE%\bin\forge.exe
 ```
 
 Installs to `%USERPROFILE%\bin\forge.exe` and prints the exact `PATH` command
