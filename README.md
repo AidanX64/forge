@@ -1,0 +1,87 @@
+# Forge
+
+A package manager and automated build system for **C, C++, and Assembly**.
+
+Forge exists to kill three problems: dependency hell, verbose hand-written
+build scripts, and painful cross-platform / cross-architecture compilation.
+The goal is a build UX as simple as:
+
+```sh
+forge run --release
+```
+
+regardless of target OS, architecture, or toolchain.
+
+## Philosophy
+
+Forge takes heavy inspiration from **Cargo** (Rust's package manager) —
+same ergonomics, same "it just works" feel — applied to a language
+ecosystem that has never really had it.
+
+Implementation language rules for Forge itself:
+
+- **C** — primary, default language for everything.
+- **C++** — only when a feature is materially harder or impossible in C.
+- **Assembly** — only in hot paths worth hand-optimizing, not
+  speculatively, and always commented so the optimization is legible
+  rather than a black box.
+
+(Rust was considered for implementing Forge itself, but dropped in favor
+of raw C.)
+
+## Features
+
+### Build orchestration
+Simple, Cargo-style commands (`forge run`, `forge run --release`, ...)
+replace verbose, hand-rolled Makefiles/build scripts.
+
+### Cross-platform compiler dispatch
+Forge detects the host OS and version at build time and automatically
+invokes the platform's native compiler, falling back to `clang` when no
+suitable native compiler is available.
+
+### Manifest-based config
+Project configuration lives in a custom manifest file, modeled on
+`Cargo.toml` — declarative, not scripted.
+
+### Parallel multi-platform runners
+Build/test runners can run in parallel across heterogeneous machines:
+native or cloud, VM or bare metal, communicating over raw TCP. The
+runner pool is assumed heterogeneous (mixed OS/arch/GPU), not a
+uniform fleet.
+
+Graphics programming was a core consideration from day one, not an
+afterthought — runner machines with a **real GPU and a monitor** are
+preferred over headless boxes, since graphics-program builds need to
+actually render to be verified.
+
+### Clearer debugging
+The `debug` subcommand shells out to the target OS's native debugger
+(or a chosen third-party one) and post-processes the output into
+something more readable — e.g. a lifter-style disassembly/stack view
+instead of a raw debugger dump.
+
+### Verbose, readable logs
+All build/run/debug output is written to a `/target` directory.
+Logs are verbose by default and meant to be easy for a human to read,
+not just machine-parsed.
+
+## Scope
+
+**v1 is build orchestration only.** Dependency fetching and package
+management are explicitly **out of scope for v1** — Forge behaves as a
+build system first; the "package manager" ambitions come later.
+
+## Non-Goals (for now)
+
+- Dependency/package fetching and resolution
+- Support for languages other than C, C++, and Assembly
+
+## Status
+
+Early / conceptual — design is set, implementation in raw C is
+in progress.
+
+## License
+
+TBD.
