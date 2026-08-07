@@ -94,6 +94,7 @@ cd <your-project>       # any dir with a Forge.toml + src/
 forge run               # build (debug) and run
 forge run --release     # build (release) and run
 forge debug             # build, then launch a debugger
+forge clean             # remove the project's target/ output
 ```
 
 Try it immediately against the bundled fixture:

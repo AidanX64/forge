@@ -11,6 +11,7 @@ static void print_usage(FILE *stream)
             "Usage:\n"
             "  forge run [--release] [--manifest PATH]\n"
             "  forge debug [--release] [--manifest PATH]\n"
+            "  forge clean [--manifest PATH]\n"
             "  forge runner ...\n");
 }
 
@@ -19,6 +20,7 @@ int forge_cli_main(int argc, char **argv)
     const char *manifest_path = "Forge.toml";
     int release = 0;
     int debug;
+    int clean;
     int index;
 
     if (argc == 1 || strcmp(argv[1], "--help") == 0 ||
@@ -27,7 +29,8 @@ int forge_cli_main(int argc, char **argv)
         return 0;
     }
     debug = strcmp(argv[1], "debug") == 0;
-    if (strcmp(argv[1], "run") != 0 && !debug) {
+    clean = strcmp(argv[1], "clean") == 0;
+    if (strcmp(argv[1], "run") != 0 && !debug && !clean) {
         fprintf(stderr, "forge: unsupported command '%s'\n", argv[1]);
         print_usage(stderr);
         return 1;
@@ -39,9 +42,12 @@ int forge_cli_main(int argc, char **argv)
             manifest_path = argv[++index];
         } else {
             fprintf(stderr, "forge: unsupported %s option '%s'\n",
-                    debug ? "debug" : "run", argv[index]);
+                    clean ? "clean" : debug ? "debug" : "run", argv[index]);
             return 1;
         }
+    }
+    if (clean) {
+        return forge_orchestrate_clean(manifest_path);
     }
     return debug ? forge_orchestrate_debug(manifest_path, release) :
                    forge_orchestrate_run(manifest_path, release);

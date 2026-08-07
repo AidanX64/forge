@@ -12,6 +12,7 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #include "forge/compiler.h"
@@ -482,6 +483,115 @@ static int ensure_directory(const char *path)
     return 0;
 }
 
+#ifdef _WIN32
+static int remove_tree(const char *path)
+{
+    WIN32_FIND_DATAA entry;
+    HANDLE handle;
+    char pattern[FORGE_PATH_MAX];
+
+    if (path_join(pattern, sizeof(pattern), path, "*") != 0) {
+        print_error("clean path is too long: %s", path);
+        return -1;
+    }
+    handle = FindFirstFileA(pattern, &entry);
+    if (handle == INVALID_HANDLE_VALUE) {
+        if (GetLastError() == ERROR_FILE_NOT_FOUND ||
+            GetLastError() == ERROR_PATH_NOT_FOUND) {
+            return 0;
+        }
+        print_error("could not open directory to clean '%s' (error %lu)", path,
+                    (unsigned long)GetLastError());
+        return -1;
+    }
+    do {
+        char child[FORGE_PATH_MAX];
+
+        if (strcmp(entry.cFileName, ".") == 0 || strcmp(entry.cFileName, "..") == 0) {
+            continue;
+        }
+        if (path_join(child, sizeof(child), path, entry.cFileName) != 0) {
+            print_error("clean path is too long under '%s'", path);
+            (void)FindClose(handle);
+            return -1;
+        }
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
+            if (remove_tree(child) != 0) {
+                (void)FindClose(handle);
+                return -1;
+            }
+        } else if (DeleteFileA(child) == 0) {
+            print_error("could not delete file '%s' (error %lu)", child,
+                        (unsigned long)GetLastError());
+            (void)FindClose(handle);
+            return -1;
+        }
+    } while (FindNextFileA(handle, &entry) != 0);
+
+    if (GetLastError() != ERROR_NO_MORE_FILES) {
+        print_error("could not finish cleaning '%s' (error %lu)", path,
+                    (unsigned long)GetLastError());
+        (void)FindClose(handle);
+        return -1;
+    }
+    (void)FindClose(handle);
+    if (RemoveDirectoryA(path) == 0) {
+        print_error("could not remove directory '%s' (error %lu)", path,
+                    (unsigned long)GetLastError());
+        return -1;
+    }
+    return 0;
+}
+#else
+static int remove_tree(const char *path)
+{
+    DIR *stream = opendir(path);
+    struct dirent *entry;
+
+    if (stream == NULL) {
+        if (errno == ENOENT) {
+            return 0;
+        }
+        print_error("could not open directory to clean '%s': %s", path, strerror(errno));
+        return -1;
+    }
+    while ((entry = readdir(stream)) != NULL) {
+        char child[FORGE_PATH_MAX];
+        struct stat details;
+
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+        if (path_join(child, sizeof(child), path, entry->d_name) != 0) {
+            print_error("clean path is too long under '%s'", path);
+            (void)closedir(stream);
+            return -1;
+        }
+        if (stat(child, &details) != 0) {
+            print_error("could not inspect '%s': %s", child, strerror(errno));
+            (void)closedir(stream);
+            return -1;
+        }
+        if (S_ISDIR(details.st_mode)) {
+            if (remove_tree(child) != 0) {
+                (void)closedir(stream);
+                return -1;
+            }
+        } else if (unlink(child) != 0) {
+            print_error("could not delete '%s': %s", child, strerror(errno));
+            (void)closedir(stream);
+            return -1;
+        }
+    }
+    (void)closedir(stream);
+    if (rmdir(path) != 0) {
+        print_error("could not remove directory '%s': %s", path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+#endif
+
 static const char *host_architecture(void)
 {
 #if defined(_M_X64) || defined(__x86_64__) || defined(__amd64__)
@@ -758,4 +868,28 @@ int forge_orchestrate_debug(const char *manifest_path, int release)
     forge_logger_close(&logger);
     active_logger = NULL;
     return result;
+}
+
+/*
+ * Removes the project's target/ directory (build output and logs). The target
+ * path is anchored to the manifest directory, matching build behavior.
+ */
+int forge_orchestrate_clean(const char *manifest_path)
+{
+    char project_root[FORGE_PATH_MAX];
+    char target_path[FORGE_PATH_MAX];
+
+    if (compute_project_root(manifest_path, project_root, sizeof(project_root)) != 0) {
+        return 1;
+    }
+    if (resolve_project_path(project_root, "target", target_path, sizeof(target_path)) != 0) {
+        print_error("clean path is too long");
+        return 1;
+    }
+    printf("forge: removing %s\n", target_path);
+    if (remove_tree(target_path) != 0) {
+        return 1;
+    }
+    printf("forge: clean\n");
+    return 0;
 }
