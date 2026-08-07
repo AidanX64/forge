@@ -1,0 +1,76 @@
+name: CI
+
+on:
+  push:
+    paths:
+      - "**.c"
+      - "**.h"
+      - "**/Makefile"
+      - "**/Forge.toml"
+  pull_request:
+    paths:
+      - "**.c"
+      - "**.h"
+      - "**/Makefile"
+      - "**/Forge.toml"
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} (${{ matrix.compiler }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc
+          - os: macos-latest
+            compiler: clang
+          - os: windows-latest
+            compiler: gcc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2 (Windows gcc)
+        if: matrix.os == 'windows-latest'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: gcc make
+
+      - name: Build (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: make
+
+      - name: Build (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: make CC=${{ matrix.compiler }}
+
+      - name: Run `make test`
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: make test
+
+      - name: Run `make test` (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: make test CC=${{ matrix.compiler }}
+
+      - name: Self-hosting end-to-end test (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: target/forge.exe run --release
+
+      - name: Self-hosting end-to-end test (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: target/forge run --release
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: forge-${{ matrix.os }}-${{ matrix.compiler }}
+          path: target/forge*
+          retention-days: 1
+          if-no-files-found: warn
