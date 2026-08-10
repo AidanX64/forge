@@ -3,7 +3,7 @@ CFLAGS ?= -Wall -Wextra -Werror -std=c11 -Iinclude
 LDFLAGS ?=
 LDLIBS ?=
 
-TARGET_DIR := target
+TARGET_DIR := build
 
 ifeq ($(OS),Windows_NT)
 EXE := .exe

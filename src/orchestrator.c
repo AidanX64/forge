@@ -2,6 +2,10 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 
+#ifdef _MSC_VER
+#define _CRT_SECURE_NO_WARNINGS
+#endif
+
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>

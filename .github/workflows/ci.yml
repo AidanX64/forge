@@ -61,16 +61,16 @@ jobs:
       - name: Self-hosting end-to-end test (Windows)
         if: matrix.os == 'windows-latest'
         shell: msys2 {0}
-        run: target/forge.exe run --release
+        run: build/forge.exe run --release
 
       - name: Self-hosting end-to-end test (Linux/macOS)
         if: matrix.os != 'windows-latest'
-        run: target/forge run --release
+        run: build/forge run --release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: forge-${{ matrix.os }}-${{ matrix.compiler }}
-          path: target/forge*
+          path: build/forge*
           retention-days: 1
           if-no-files-found: warn

@@ -9,8 +9,8 @@ set -e
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
 prefix="${XDG_BIN_HOME:-$HOME/.local/bin}"
-target_dir="$root/target"
-exe="$target_dir/forge"
+build_dir="$root/build"
+exe="$build_dir/forge"
 installed="$prefix/forge"
 
 if command -v gcc >/dev/null 2>&1; then
@@ -22,7 +22,7 @@ else
     exit 1
 fi
 
-mkdir -p "$target_dir" "$prefix"
+mkdir -p "$build_dir" "$prefix"
 $compiler -Wall -Wextra -Werror -std=c11 -I"$root/include" "$root"/src/*.c -o "$exe"
 cp "$exe" "$installed"
 chmod +x "$installed"

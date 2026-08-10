@@ -4,9 +4,9 @@
 $ErrorActionPreference = 'Stop'
 
 $root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$targetDir = Join-Path $root 'target'
+$buildDir = Join-Path $root 'build'
 $binDir = Join-Path $env:USERPROFILE 'bin'
-$builtExe = Join-Path $targetDir 'forge.exe'
+$builtExe = Join-Path $buildDir 'forge.exe'
 $installedExe = Join-Path $binDir 'forge.exe'
 
 if (Get-Command gcc -ErrorAction SilentlyContinue) {
@@ -18,7 +18,7 @@ if (Get-Command gcc -ErrorAction SilentlyContinue) {
     exit 1
 }
 
-New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 $sources = Get-ChildItem (Join-Path $root 'src') -Filter '*.c' | ForEach-Object { $_.FullName }
 
 & $compiler -Wall -Wextra -Werror -std=c11 "-I$(Join-Path $root 'include')" $sources -o $builtExe

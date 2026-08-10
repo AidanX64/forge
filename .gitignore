@@ -1,5 +1,6 @@
 /target/
-test/target/
+/test/target/
+/build/
 *.exe
 *.obj
 *.o

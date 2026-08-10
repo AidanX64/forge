@@ -6,6 +6,39 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+/*
+ * RtlGetVersion is declared in winternl.h on some SDKs but not all (it is
+ * missing from the 10.0.26100 Windows SDK). Resolve it at runtime from ntdll
+ * instead, so no extra link dependency is introduced for host OS detection.
+ */
+typedef struct ForgeRtlOsVersionInfo {
+    ULONG dwOSVersionInfoSize;
+    ULONG dwMajorVersion;
+    ULONG dwMinorVersion;
+    ULONG dwBuildNumber;
+    ULONG dwPlatformId;
+    WCHAR szCSDVersion[128];
+} ForgeRtlOsVersionInfo;
+typedef LONG (WINAPI *ForgeRtlGetVersionFn)(ForgeRtlOsVersionInfo *);
+
+static LONG rtl_get_version(ForgeRtlOsVersionInfo *version)
+{
+    HMODULE ntdll;
+    ForgeRtlGetVersionFn get_version;
+
+    if (version == NULL) {
+        return -1;
+    }
+    ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == NULL) {
+        return -1;
+    }
+    get_version = (ForgeRtlGetVersionFn)(void *)GetProcAddress(ntdll, "RtlGetVersion");
+    if (get_version == NULL) {
+        return -1;
+    }
+    return get_version(version);
+}
 #elif defined(__linux__)
 #include <sys/utsname.h>
 #elif defined(__APPLE__)
@@ -112,11 +145,16 @@ int forge_detect_host(ForgeHostInfo *host, char *error, size_t error_size)
 
 #ifdef _WIN32
     {
-        OSVERSIONINFOEXA version = {0};
+        ForgeRtlOsVersionInfo version = {0};
         version.dwOSVersionInfoSize = sizeof(version);
         host->os = FORGE_HOST_OS_WINDOWS;
         (void)snprintf(host->os_name, sizeof(host->os_name), "windows");
-        if (GetVersionExA((OSVERSIONINFOA *)&version) == 0) {
+        /*
+         * GetVersionExA is deprecated and reports a skewed Windows 10/11
+         * build number unless the binary embeds a compatibility manifest.
+         * RtlGetVersion returns the real OS version and is not deprecated.
+         */
+        if (rtl_get_version(&version) != 0 || version.dwMajorVersion == 0U) {
             (void)snprintf(host->version, sizeof(host->version), "unknown");
         } else {
             (void)snprintf(host->version, sizeof(host->version), "%lu.%lu.%lu",
@@ -171,6 +209,22 @@ static int select_program(const char *program, ForgeCompilerKind kind, int fallb
     return 0;
 }
 
+/*
+ * MSVC's cl.exe is only usable when the Visual Studio environment has been
+ * initialized (INCLUDE/LIB variables must point at the SDK and CRT headers).
+ * A bare cl.exe on PATH will error with C1083 on every system header, so
+ * treat it as unavailable unless its environment is actually set up.
+ */
+static int msvc_environment_ready(void)
+{
+#ifdef _WIN32
+    const char *include = getenv("INCLUDE");
+    return include != NULL && include[0] != '\0';
+#else
+    return 0;
+#endif
+}
+
 int forge_compiler_select(const ForgeHostInfo *host, const char *override_program,
                           ForgeCompiler *compiler, char *error, size_t error_size)
 {
@@ -188,14 +242,19 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
 
     switch (host->os) {
     case FORGE_HOST_OS_WINDOWS:
-        if (program_available("cl")) {
+        if (msvc_environment_ready() && program_available("cl")) {
             return select_program("cl", FORGE_COMPILER_MSVC, 0,
                                   "using Windows native compiler", compiler,
                                   error, error_size);
         }
+        if (program_available("gcc")) {
+            return select_program("gcc", FORGE_COMPILER_GCC, 1,
+                                  "MSVC was not usable; using gcc fallback", compiler,
+                                  error, error_size);
+        }
         return select_program("clang", FORGE_COMPILER_CLANG, 1,
-                              "MSVC was not found; using clang fallback", compiler,
-                              error, error_size);
+                              "MSVC and gcc were not usable; using clang fallback",
+                              compiler, error, error_size);
     case FORGE_HOST_OS_LINUX:
         if (program_available("gcc")) {
             return select_program("gcc", FORGE_COMPILER_GCC, 0,

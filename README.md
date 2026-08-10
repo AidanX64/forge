@@ -37,7 +37,7 @@ toolchain required. The only dependency is a C compiler.
 ### Make (Linux / macOS / Windows with GNU make)
 
 ```sh
-make                    # builds target/forge
+make                    # builds build/forge
 make test               # builds and runs `forge --help`
 ```
 
@@ -45,10 +45,10 @@ make test               # builds and runs `forge --help`
 
 ```sh
 # Linux / macOS
-gcc -Wall -Wextra -Werror -std=c11 -Iinclude src/*.c -o target/forge
+gcc -Wall -Wextra -Werror -std=c11 -Iinclude src/*.c -o build/forge
 
 # Windows
-gcc -Wall -Wextra -Werror -std=c11 -Iinclude src/*.c -o target\forge.exe
+gcc -Wall -Wextra -Werror -std=c11 -Iinclude src/*.c -o build\forge.exe
 ```
 
 ## Installation
@@ -66,7 +66,7 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 Or with GNU make (e.g. MSYS2 / Git Bash):
 
 ```sh
-make                    # builds target\forge.exe
+make                    # builds build\forge.exe
 make install            # copies it to %USERPROFILE%\bin\forge.exe
 ```
 
