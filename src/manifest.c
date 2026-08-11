@@ -2,12 +2,11 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include <ctype.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
 
 #include "forge/manifest.h"
+#include "forge_util.h"
 
 #define FORGE_MANIFEST_LINE_MAX 4096U
 
@@ -32,35 +31,6 @@ typedef struct ForgeManifestSeen {
     int debug_cflags;
     int release_cflags;
 } ForgeManifestSeen;
-
-static void set_error(char *error, size_t error_size, const char *format, ...)
-{
-    va_list arguments;
-
-    if (error == NULL || error_size == 0U) {
-        return;
-    }
-
-    va_start(arguments, format);
-    (void)vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
-
-static char *trim(char *text)
-{
-    char *end;
-
-    while (isspace((unsigned char)*text)) {
-        ++text;
-    }
-
-    end = text + strlen(text);
-    while (end > text && isspace((unsigned char)end[-1])) {
-        --end;
-    }
-    *end = '\0';
-    return text;
-}
 
 static void remove_comment(char *text)
 {
@@ -89,7 +59,7 @@ static int parse_string(char **cursor, char *destination, size_t destination_siz
     size_t length = 0U;
 
     if (*source != '"') {
-        set_error(error, error_size, "expected a quoted string");
+        forge_util_set_error(error, error_size, "expected a quoted string");
         return -1;
     }
 
@@ -99,7 +69,7 @@ static int parse_string(char **cursor, char *destination, size_t destination_siz
 
         if (character == '\\') {
             if (*source != '"' && *source != '\\') {
-                set_error(error, error_size,
+                forge_util_set_error(error, error_size,
                           "only \\\" and \\\\ escapes are supported");
                 return -1;
             }
@@ -107,7 +77,7 @@ static int parse_string(char **cursor, char *destination, size_t destination_siz
         }
 
         if (length + 1U >= destination_size) {
-            set_error(error, error_size, "string exceeds %u characters",
+            forge_util_set_error(error, error_size, "string exceeds %u characters",
                       (unsigned int)(destination_size - 1U));
             return -1;
         }
@@ -115,7 +85,7 @@ static int parse_string(char **cursor, char *destination, size_t destination_siz
     }
 
     if (*source != '"') {
-        set_error(error, error_size, "unterminated quoted string");
+        forge_util_set_error(error, error_size, "unterminated quoted string");
         return -1;
     }
 
@@ -127,20 +97,20 @@ static int parse_string(char **cursor, char *destination, size_t destination_siz
 static int parse_string_list(char *value, ForgeStringList *list,
                              char *error, size_t error_size)
 {
-    char *cursor = trim(value);
+    char *cursor = forge_util_trim(value);
 
     if (*cursor != '[') {
-        set_error(error, error_size, "expected a string array starting with '['");
+        forge_util_set_error(error, error_size, "expected a string array starting with '['");
         return -1;
     }
 
     ++cursor;
-    cursor = trim(cursor);
+    cursor = forge_util_trim(cursor);
     list->count = 0U;
     if (*cursor == ']') {
-        cursor = trim(cursor + 1);
+        cursor = forge_util_trim(cursor + 1);
         if (*cursor != '\0') {
-            set_error(error, error_size, "unexpected text after string array");
+            forge_util_set_error(error, error_size, "unexpected text after string array");
             return -1;
         }
         return 0;
@@ -148,7 +118,7 @@ static int parse_string_list(char *value, ForgeStringList *list,
 
     for (;;) {
         if (list->count == FORGE_MANIFEST_MAX_ITEMS) {
-            set_error(error, error_size, "array has more than %u entries",
+            forge_util_set_error(error, error_size, "array has more than %u entries",
                       FORGE_MANIFEST_MAX_ITEMS);
             return -1;
         }
@@ -157,27 +127,27 @@ static int parse_string_list(char *value, ForgeStringList *list,
             return -1;
         }
         if (list->items[list->count][0] == '\0') {
-            set_error(error, error_size, "empty strings are not allowed in arrays");
+            forge_util_set_error(error, error_size, "empty strings are not allowed in arrays");
             return -1;
         }
         ++list->count;
 
-        cursor = trim(cursor);
+        cursor = forge_util_trim(cursor);
         if (*cursor == ']') {
-            cursor = trim(cursor + 1);
+            cursor = forge_util_trim(cursor + 1);
             if (*cursor != '\0') {
-                set_error(error, error_size, "unexpected text after string array");
+                forge_util_set_error(error, error_size, "unexpected text after string array");
                 return -1;
             }
             return 0;
         }
         if (*cursor != ',') {
-            set_error(error, error_size, "expected ',' or ']' in string array");
+            forge_util_set_error(error, error_size, "expected ',' or ']' in string array");
             return -1;
         }
-        cursor = trim(cursor + 1);
+        cursor = forge_util_trim(cursor + 1);
         if (*cursor == ']') {
-            set_error(error, error_size, "trailing commas are not allowed in arrays");
+            forge_util_set_error(error, error_size, "trailing commas are not allowed in arrays");
             return -1;
         }
     }
@@ -209,18 +179,18 @@ static ForgeManifestSection parse_section(const char *text)
 static int parse_scalar(char *value, char *destination, size_t destination_size,
                         char *error, size_t error_size)
 {
-    char *cursor = trim(value);
+    char *cursor = forge_util_trim(value);
 
     if (parse_string(&cursor, destination, destination_size, error, error_size) != 0) {
         return -1;
     }
-    cursor = trim(cursor);
+    cursor = forge_util_trim(cursor);
     if (*cursor != '\0') {
-        set_error(error, error_size, "unexpected text after quoted string");
+        forge_util_set_error(error, error_size, "unexpected text after quoted string");
         return -1;
     }
     if (destination[0] == '\0') {
-        set_error(error, error_size, "empty strings are not allowed");
+        forge_util_set_error(error, error_size, "empty strings are not allowed");
         return -1;
     }
     return 0;
@@ -229,7 +199,7 @@ static int parse_scalar(char *value, char *destination, size_t destination_size,
 static int reject_duplicate(int *seen, const char *key, char *error, size_t error_size)
 {
     if (*seen) {
-        set_error(error, error_size, "duplicate field '%s'", key);
+        forge_util_set_error(error, error_size, "duplicate field '%s'", key);
         return -1;
     }
     *seen = 1;
@@ -245,14 +215,14 @@ static int parse_assignment(ForgeManifestSection section, char *line,
     char *value;
 
     if (equals == NULL) {
-        set_error(error, error_size, "expected 'key = value'");
+        forge_util_set_error(error, error_size, "expected 'key = value'");
         return -1;
     }
     *equals = '\0';
-    key = trim(line);
-    value = trim(equals + 1);
+    key = forge_util_trim(line);
+    value = forge_util_trim(equals + 1);
     if (*key == '\0' || *value == '\0') {
-        set_error(error, error_size, "expected a non-empty key and value");
+        forge_util_set_error(error, error_size, "expected a non-empty key and value");
         return -1;
     }
 
@@ -296,7 +266,7 @@ static int parse_assignment(ForgeManifestSection section, char *line,
                                  error, error_size);
     }
 
-    set_error(error, error_size, "field '%s' is not allowed in this section", key);
+    forge_util_set_error(error, error_size, "field '%s' is not allowed in this section", key);
     return -1;
 }
 
@@ -310,13 +280,13 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
     ForgeManifestSeen seen = {0};
 
     if (path == NULL || manifest == NULL) {
-        set_error(error, error_size, "manifest path and output are required");
+        forge_util_set_error(error, error_size, "manifest path and output are required");
         return -1;
     }
     *manifest = (ForgeManifest){0};
     file = fopen(path, "r");
     if (file == NULL) {
-        set_error(error, error_size, "could not open manifest '%s'", path);
+        forge_util_set_error(error, error_size, "could not open manifest '%s'", path);
         return -1;
     }
 
@@ -324,51 +294,59 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
         char *text;
         ++line_number;
         if (strchr(line, '\n') == NULL && !feof(file)) {
-            set_error(error, error_size, "%s:%lu: line is too long", path, line_number);
+            forge_util_set_error(error, error_size, "%s:%lu: line is too long", path, line_number);
             (void)fclose(file);
             return -1;
         }
         remove_comment(line);
-        text = trim(line);
+        text = forge_util_trim(line);
         if (*text == '\0') {
             continue;
         }
         if (*text == '[') {
             section = parse_section(text);
             if (section == FORGE_SECTION_NONE) {
-                set_error(error, error_size, "%s:%lu: unknown section '%s'", path,
+                forge_util_set_error(error, error_size, "%s:%lu: unknown section '%s'", path,
                           line_number, text);
                 (void)fclose(file);
                 return -1;
             }
             continue;
         }
-        if (section == FORGE_SECTION_NONE ||
-            parse_assignment(section, text, manifest, &seen, error, error_size) != 0) {
+        if (section == FORGE_SECTION_NONE) {
+            forge_util_set_error(error, error_size, "%s:%lu: field without a section header; "
+                                  "expected a [section] line first", path, line_number);
+            (void)fclose(file);
+            return -1;
+        }
+        if (parse_assignment(section, text, manifest, &seen, error, error_size) != 0) {
             char detail[FORGE_MANIFEST_LINE_MAX];
-            (void)snprintf(detail, sizeof(detail), "%s", error == NULL ? "invalid field" : error);
-            set_error(error, error_size, "%s:%lu: %s", path, line_number, detail);
+            if (error == NULL || error[0] == '\0') {
+                (void)snprintf(detail, sizeof(detail), "invalid field");
+            } else {
+                (void)snprintf(detail, sizeof(detail), "%s", error);
+            }
+            forge_util_set_error(error, error_size, "%s:%lu: %s", path, line_number, detail);
             (void)fclose(file);
             return -1;
         }
     }
     (void)fclose(file);
 
-    if (!seen.project_name || !seen.source_c || !seen.source_cpp || !seen.source_asm ||
-        !seen.target_os || !seen.target_arch || !seen.debug_cflags ||
-        !seen.release_cflags) {
-        set_error(error, error_size,
-                  "%s: manifest requires project.name, sources.c/cpp/asm, targets.os/arch, "
+    if (!seen.project_name || !seen.target_os || !seen.target_arch ||
+        !seen.debug_cflags || !seen.release_cflags) {
+        forge_util_set_error(error, error_size,
+                  "%s: manifest requires project.name, targets.os/arch, "
                   "and profile.debug/release cflags", path);
         return -1;
     }
     if (manifest->c_source_dirs.count == 0U && manifest->cpp_source_dirs.count == 0U &&
         manifest->asm_source_dirs.count == 0U) {
-        set_error(error, error_size, "%s: at least one source directory is required", path);
+        forge_util_set_error(error, error_size, "%s: at least one source directory is required", path);
         return -1;
     }
     if (manifest->target_os.count == 0U || manifest->target_arch.count == 0U) {
-        set_error(error, error_size, "%s: targets.os and targets.arch cannot be empty", path);
+        forge_util_set_error(error, error_size, "%s: targets.os and targets.arch cannot be empty", path);
         return -1;
     }
     return 0;

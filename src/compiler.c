@@ -49,18 +49,7 @@ static LONG rtl_get_version(ForgeRtlOsVersionInfo *version)
 #endif
 
 #include "forge/compiler.h"
-
-static void set_error(char *error, size_t error_size, const char *format, ...)
-{
-    va_list arguments;
-
-    if (error == NULL || error_size == 0U) {
-        return;
-    }
-    va_start(arguments, format);
-    (void)vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#include "forge_util.h"
 
 static int command_append(char *command, size_t command_size, size_t *length,
                           const char *format, ...)
@@ -81,23 +70,6 @@ static int command_append(char *command, size_t command_size, size_t *length,
     return 0;
 }
 
-static int program_available(const char *program)
-{
-    char command[FORGE_COMPILER_VALUE_MAX * 2U];
-    int written;
-
-#if FORGE_PLATFORM_WINDOWS
-    written = snprintf(command, sizeof(command), "where \"%s\" >NUL 2>&1", program);
-#else
-    written = snprintf(command, sizeof(command), "command -v \"%s\" >/dev/null 2>&1",
-                       program);
-#endif
-    if (written < 0 || (size_t)written >= sizeof(command)) {
-        return 0;
-    }
-    return system(command) == 0;
-}
-
 static ForgeCompilerKind compiler_kind_from_program(const char *program)
 {
     if (strstr(program, "clang") != NULL) {
@@ -107,6 +79,15 @@ static ForgeCompilerKind compiler_kind_from_program(const char *program)
         return FORGE_COMPILER_MSVC;
     }
     return FORGE_COMPILER_GCC;
+}
+
+static int has_suffix(const char *text, const char *suffix)
+{
+    size_t text_length = strlen(text);
+    size_t suffix_length = strlen(suffix);
+
+    return text_length >= suffix_length &&
+           strcmp(text + text_length - suffix_length, suffix) == 0;
 }
 
 const char *forge_host_os_name(ForgeHostOs os)
@@ -140,7 +121,7 @@ const char *forge_compiler_kind_name(ForgeCompilerKind kind)
 int forge_detect_host(ForgeHostInfo *host, char *error, size_t error_size)
 {
     if (host == NULL) {
-        set_error(error, error_size, "host output is required");
+        forge_util_set_error(error, error_size, "host output is required");
         return -1;
     }
     *host = (ForgeHostInfo){0};
@@ -181,10 +162,21 @@ int forge_detect_host(ForgeHostInfo *host, char *error, size_t error_size)
         size_t version_size = sizeof(host->version);
         host->os = FORGE_HOST_OS_MACOS;
         (void)snprintf(host->os_name, sizeof(host->os_name), "macos");
+        /*
+         * sysctlbyname is deprecated in macOS 12+ and would otherwise trip
+         * -Werror. Suppress the warning just for this lookup; it still works.
+         */
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#endif
         if (sysctlbyname("kern.osproductversion", host->version, &version_size,
                          NULL, 0U) != 0) {
             (void)snprintf(host->version, sizeof(host->version), "unknown");
         }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
     }
 #else
     host->os = FORGE_HOST_OS_UNKNOWN;
@@ -198,8 +190,8 @@ static int select_program(const char *program, ForgeCompilerKind kind, int fallb
                           const char *note, ForgeCompiler *compiler,
                           char *error, size_t error_size)
 {
-    if (!program_available(program)) {
-        set_error(error, error_size, "%s; compiler '%s' is not available on PATH",
+    if (!forge_util_program_available(program)) {
+        forge_util_set_error(error, error_size, "%s; compiler '%s' is not available on PATH",
                   note, program);
         return -1;
     }
@@ -231,12 +223,17 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
                           ForgeCompiler *compiler, char *error, size_t error_size)
 {
     if (host == NULL || compiler == NULL) {
-        set_error(error, error_size, "host and compiler output are required");
+        forge_util_set_error(error, error_size, "host and compiler output are required");
         return -1;
     }
     *compiler = (ForgeCompiler){0};
 
     if (override_program != NULL && override_program[0] != '\0') {
+        if (forge_util_has_shell_unsafe_chars(override_program)) {
+            forge_util_set_error(error, error_size,
+                                 "compiler override contains characters unsafe for shell invocation");
+            return -1;
+        }
         return select_program(override_program, compiler_kind_from_program(override_program),
                               0, "using manifest compiler override", compiler,
                               error, error_size);
@@ -244,12 +241,12 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
 
     switch (host->os) {
     case FORGE_HOST_OS_WINDOWS:
-        if (msvc_environment_ready() && program_available("cl")) {
+        if (msvc_environment_ready() && forge_util_program_available("cl")) {
             return select_program("cl", FORGE_COMPILER_MSVC, 0,
                                   "using Windows native compiler", compiler,
                                   error, error_size);
         }
-        if (program_available("gcc")) {
+        if (forge_util_program_available("gcc")) {
             return select_program("gcc", FORGE_COMPILER_GCC, 1,
                                   "MSVC was not usable; using gcc fallback", compiler,
                                   error, error_size);
@@ -258,7 +255,7 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
                               "MSVC and gcc were not usable; using clang fallback",
                               compiler, error, error_size);
     case FORGE_HOST_OS_LINUX:
-        if (program_available("gcc")) {
+        if (forge_util_program_available("gcc")) {
             return select_program("gcc", FORGE_COMPILER_GCC, 0,
                                   "using Linux native compiler", compiler,
                                   error, error_size);
@@ -276,7 +273,7 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
                               compiler, error, error_size);
     }
 
-    set_error(error, error_size, "invalid detected host OS");
+    forge_util_set_error(error, error_size, "invalid detected host OS");
     return -1;
 }
 
@@ -296,6 +293,7 @@ int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
                                         ForgeSourceLanguage language,
                                         const char *source_path,
                                         const char *object_path,
+                                        const char *project_root,
                                         const char *target_os,
                                         const char *target_arch,
                                         const char *const *flags, size_t flag_count,
@@ -307,50 +305,72 @@ int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
     size_t length = 0U;
 
     if (compiler == NULL || source_path == NULL || object_path == NULL ||
-        target_os == NULL || target_arch == NULL || command == NULL || command_size == 0U) {
-        set_error(error, error_size, "compiler, paths, target, and command output are required");
+        project_root == NULL || target_os == NULL || target_arch == NULL ||
+        command == NULL || command_size == 0U) {
+        forge_util_set_error(error, error_size, "compiler, paths, target, and command output are required");
         return -1;
     }
-    if (source_path[0] == '\0' || object_path[0] == '\0' ||
+    if (source_path[0] == '\0' || object_path[0] == '\0' || project_root[0] == '\0' ||
         target_os[0] == '\0' || target_arch[0] == '\0') {
-        set_error(error, error_size, "source, object, target OS, and target architecture are required");
+        forge_util_set_error(error, error_size, "source, object, project root, target OS, and target architecture are required");
         return -1;
     }
     command[0] = '\0';
 
+    if (forge_util_has_shell_unsafe_chars(compiler->program) ||
+        forge_util_has_shell_unsafe_chars(project_root) ||
+        forge_util_has_shell_unsafe_chars(source_path) ||
+        forge_util_has_shell_unsafe_chars(object_path)) {
+        forge_util_set_error(error, error_size,
+                             "compiler or paths contain characters unsafe for shell invocation");
+        return -1;
+    }
+
     if (compiler->kind == FORGE_COMPILER_MSVC && language == FORGE_SOURCE_ASM) {
         program = strcmp(target_arch, "x86_64") == 0 ? "ml64" : "ml";
-        if (!program_available(program)) {
-            set_error(error, error_size, "MSVC assembly requires '%s' on PATH", program);
+        if (!forge_util_program_available(program)) {
+            forge_util_set_error(error, error_size, "MSVC assembly requires '%s' on PATH", program);
             return -1;
         }
         if (command_append(command, command_size, &length,
                            "%s /nologo /c /Fo\"%s\" \"%s\"",
                            program, object_path, source_path) != 0) {
-            set_error(error, error_size, "compile command is too long");
+            forge_util_set_error(error, error_size, "compile command is too long");
             return -1;
         }
+    } else if (language == FORGE_SOURCE_ASM && has_suffix(source_path, ".asm")) {
+        /*
+         * GCC/Clang drive the source with their own assembler, which
+         * understands .s/.S but not the MSVC-flavoured .asm dialect.
+         */
+        forge_util_set_error(error, error_size,
+                             "the '%s' compiler cannot assemble '.asm' files; "
+                             "use .s/.S with GCC/Clang, or the MSVC toolchain for .asm",
+                             compiler->program);
+        return -1;
     } else if (compiler->kind == FORGE_COMPILER_MSVC) {
         if (command_append(command, command_size, &length,
-                           "%s /nologo /I\"include\" /c /Fo\"%s\" \"%s\"",
-                           compiler->program, object_path, source_path) != 0) {
-            set_error(error, error_size, "compile command is too long");
+                           "%s /nologo /I\"%s/include\" /c /Fo\"%s\" \"%s\"",
+                           compiler->program, project_root, object_path,
+                           source_path) != 0) {
+            forge_util_set_error(error, error_size, "compile command is too long");
             return -1;
         }
     } else {
         program = language == FORGE_SOURCE_CPP ? cpp_driver(compiler) : compiler->program;
         if (command_append(command, command_size, &length,
-                           "%s -I\"include\" -c \"%s\" -o \"%s\"",
-                           program, source_path, object_path) != 0) {
-            set_error(error, error_size, "compile command is too long");
+                           "%s -I\"%s/include\" -c \"%s\" -o \"%s\"",
+                           program, project_root, source_path, object_path) != 0) {
+            forge_util_set_error(error, error_size, "compile command is too long");
             return -1;
         }
     }
 
     for (index = 0U; index < flag_count; ++index) {
         if (flags == NULL || flags[index] == NULL || flags[index][0] == '\0' ||
+            forge_util_has_shell_unsafe_chars(flags[index]) ||
             command_append(command, command_size, &length, " %s", flags[index]) != 0) {
-            set_error(error, error_size, "invalid or excessive compiler flags");
+            forge_util_set_error(error, error_size, "invalid or unsafe compiler flags");
             return -1;
         }
     }
@@ -373,42 +393,50 @@ int forge_compiler_make_link_command(const ForgeCompiler *compiler,
     if (compiler == NULL || object_paths == NULL || object_count == 0U ||
         output_path == NULL || output_path[0] == '\0' ||
         command == NULL || command_size == 0U) {
-        set_error(error, error_size, "compiler, object files, output, and command output are required");
+        forge_util_set_error(error, error_size, "compiler, object files, output, and command output are required");
         return -1;
     }
     command[0] = '\0';
+    if (forge_util_has_shell_unsafe_chars(compiler->program) ||
+        forge_util_has_shell_unsafe_chars(output_path)) {
+        forge_util_set_error(error, error_size,
+                             "compiler or output path contains characters unsafe for shell invocation");
+        return -1;
+    }
     program = has_cpp_source ? cpp_driver(compiler) : compiler->program;
     if (compiler->kind == FORGE_COMPILER_MSVC) {
         program = compiler->program;
         if (command_append(command, command_size, &length, "%s /nologo", program) != 0) {
-            set_error(error, error_size, "link command is too long");
+            forge_util_set_error(error, error_size, "link command is too long");
             return -1;
         }
     } else if (command_append(command, command_size, &length, "%s", program) != 0) {
-        set_error(error, error_size, "link command is too long");
+        forge_util_set_error(error, error_size, "link command is too long");
         return -1;
     }
 
     for (index = 0U; index < object_count; ++index) {
         if (object_paths[index] == NULL || object_paths[index][0] == '\0' ||
+            forge_util_has_shell_unsafe_chars(object_paths[index]) ||
             command_append(command, command_size, &length, " \"%s\"", object_paths[index]) != 0) {
-            set_error(error, error_size, "invalid or excessive object file list");
+            forge_util_set_error(error, error_size, "invalid or unsafe object file list");
             return -1;
         }
     }
     if (compiler->kind == FORGE_COMPILER_MSVC) {
         if (command_append(command, command_size, &length, " /Fe\"%s\"", output_path) != 0) {
-            set_error(error, error_size, "link command is too long");
+            forge_util_set_error(error, error_size, "link command is too long");
             return -1;
         }
     } else if (command_append(command, command_size, &length, " -o \"%s\"", output_path) != 0) {
-        set_error(error, error_size, "link command is too long");
+        forge_util_set_error(error, error_size, "link command is too long");
         return -1;
     }
     for (index = 0U; index < flag_count; ++index) {
         if (flags == NULL || flags[index] == NULL || flags[index][0] == '\0' ||
+            forge_util_has_shell_unsafe_chars(flags[index]) ||
             command_append(command, command_size, &length, " %s", flags[index]) != 0) {
-            set_error(error, error_size, "invalid or excessive linker flags");
+            forge_util_set_error(error, error_size, "invalid or unsafe linker flags");
             return -1;
         }
     }

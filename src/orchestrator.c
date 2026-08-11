@@ -660,6 +660,50 @@ static void safe_output_name(const char *project_name, char *output, size_t outp
     output[index] = '\0';
 }
 
+/*
+ * Stable FNV-1a hash of a source path. Object files are named after this hash
+ * instead of their compile index, so adding/removing/reordering sources never
+ * makes an object file "belong" to a different source than the one stored in
+ * it (which an index-based scheme would allow once we skip fresh files).
+ */
+static unsigned int source_hash(const char *text)
+{
+    unsigned int hash = 2166136261U;
+
+    while (*text != '\0') {
+        hash ^= (unsigned char)*text++;
+        hash *= 16777619U;
+    }
+    return hash;
+}
+
+/*
+ * Returns 1 when an existing object file is at least as new as its source, so
+ * the compile step can be skipped. Only source mtimes are compared; header
+ * dependency tracking is a later improvement (see README).
+ */
+static int object_is_fresh(const char *object_path, const char *source_path)
+{
+#if FORGE_PLATFORM_WINDOWS
+    WIN32_FILE_ATTRIBUTE_DATA object_data;
+    WIN32_FILE_ATTRIBUTE_DATA source_data;
+
+    if (GetFileAttributesExA(object_path, GetFileExInfoStandard, &object_data) == 0 ||
+        GetFileAttributesExA(source_path, GetFileExInfoStandard, &source_data) == 0) {
+        return 0;
+    }
+    return CompareFileTime(&object_data.ftLastWriteTime, &source_data.ftLastWriteTime) >= 0;
+#else
+    struct stat object_stat;
+    struct stat source_stat;
+
+    if (stat(object_path, &object_stat) != 0 || stat(source_path, &source_stat) != 0) {
+        return 0;
+    }
+    return object_stat.st_mtime >= source_stat.st_mtime;
+#endif
+}
+
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
                         int release, int should_run,
                         char *built_executable, size_t built_executable_size)
@@ -740,22 +784,34 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     forge_logger_log(active_logger, "compile", "----- compile %zu source file(s) -----",
                      sources.count);
     for (source_index = 0U; source_index < sources.count; ++source_index) {
+        const char *source_path = sources.items[source_index].path;
         int written = snprintf(object_paths[source_index], sizeof(object_paths[source_index]),
-                               "%s/%04zu.o", object_directory, source_index);
-        if (written < 0 || (size_t)written >= sizeof(object_paths[source_index]) ||
-            forge_compiler_make_compile_command(&compiler, sources.items[source_index].language,
-                                                sources.items[source_index].path,
-                                                object_paths[source_index], target_os,
+                               "%s/%08x.o", object_directory, source_hash(source_path));
+        if (written < 0 || (size_t)written >= sizeof(object_paths[source_index])) {
+            print_error("object path is too long");
+            goto cleanup;
+        }
+        if (object_is_fresh(object_paths[source_index], source_path)) {
+            forge_logger_log(active_logger, "compile", "up-to-date: %s", source_path);
+            object_references[source_index] = object_paths[source_index];
+            if (sources.items[source_index].language == FORGE_SOURCE_CPP) {
+                has_cpp_source = 1;
+            }
+            continue;
+        }
+        if (forge_compiler_make_compile_command(&compiler, sources.items[source_index].language,
+                                                source_path,
+                                                object_paths[source_index], project_root,
+                                                target_os,
                                                 target_arch, flags, profile->cflags.count,
                                                 command, sizeof(command), error,
                                                 sizeof(error)) != 0) {
             print_error("%s", error);
             goto cleanup;
         }
-        forge_logger_log(active_logger, "compile", "source: %s",
-                         sources.items[source_index].path);
+        forge_logger_log(active_logger, "compile", "source: %s", source_path);
         if (run_external_command("compile", command, 1) != 0) {
-            print_error("compiler failed for %s", sources.items[source_index].path);
+            print_error("compiler failed for %s", source_path);
             print_log_tail(24U);
             goto cleanup;
         }

@@ -7,12 +7,14 @@ on:
       - "**.h"
       - "**/Makefile"
       - "**/Forge.toml"
+      - ".github/workflows/ci.yml"
   pull_request:
     paths:
       - "**.c"
       - "**.h"
       - "**/Makefile"
       - "**/Forge.toml"
+      - ".github/workflows/ci.yml"
 
 jobs:
   build-and-test:

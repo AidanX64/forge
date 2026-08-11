@@ -1,4 +1,8 @@
-CC ?= gcc
+# GNU make ships a built-in CC=cc that ?= can never override; only apply the
+# gcc default when the caller has not set CC themselves (env/command line win).
+ifeq ($(origin CC),default)
+CC := gcc
+endif
 CFLAGS ?= -Wall -Wextra -Werror -std=c11 -Iinclude
 LDFLAGS ?=
 LDLIBS ?=

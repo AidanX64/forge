@@ -38,7 +38,7 @@ static void finish_invocation(ForgeLogger *logger)
 int forge_orchestrate_run(const char *manifest_path, int release)
 {
     ForgeManifest manifest;
-    ForgeLogger logger;
+    ForgeLogger logger = {0};
     char root[FORGE_PATH_MAX];
     int result;
 
@@ -55,7 +55,7 @@ int forge_orchestrate_run(const char *manifest_path, int release)
 int forge_orchestrate_debug(const char *manifest_path, int release)
 {
     ForgeManifest manifest;
-    ForgeLogger logger;
+    ForgeLogger logger = {0};
     char error[FORGE_COMMAND_MAX] = {0};
     char root[FORGE_PATH_MAX];
     char executable[FORGE_PATH_MAX];

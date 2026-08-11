@@ -23,31 +23,20 @@
 #endif
 
 #include "forge/log.h"
-
-static void set_error(char *error, size_t error_size, const char *format, ...)
-{
-    va_list arguments;
-
-    if (error == NULL || error_size == 0U) {
-        return;
-    }
-    va_start(arguments, format);
-    (void)vsnprintf(error, error_size, format, arguments);
-    va_end(arguments);
-}
+#include "forge_util.h"
 
 static int create_directory(const char *path, char *error, size_t error_size)
 {
 #if FORGE_PLATFORM_WINDOWS
     if (CreateDirectoryA(path, NULL) == 0 &&
         GetLastError() != ERROR_ALREADY_EXISTS) {
-        set_error(error, error_size, "could not create output directory '%s' (error %lu)",
+        forge_util_set_error(error, error_size, "could not create output directory '%s' (error %lu)",
                   path, (unsigned long)GetLastError());
         return -1;
     }
 #else
     if (mkdir(path, 0777) != 0 && errno != EEXIST) {
-        set_error(error, error_size, "could not create output directory '%s': %s",
+        forge_util_set_error(error, error_size, "could not create output directory '%s': %s",
                   path, strerror(errno));
         return -1;
     }
@@ -61,7 +50,7 @@ static int create_log_directory(const char *root, char *error, size_t error_size
 
     if (snprintf(path, sizeof(path), "%s/target", root) < 0 ||
         (size_t)snprintf(path, sizeof(path), "%s/target", root) >= sizeof(path)) {
-        set_error(error, error_size, "project root path is too long");
+        forge_util_set_error(error, error_size, "project root path is too long");
         return -1;
     }
     if (create_directory(path, error, error_size) != 0) {
@@ -69,7 +58,7 @@ static int create_log_directory(const char *root, char *error, size_t error_size
     }
     if (snprintf(path, sizeof(path), "%s/target/logs", root) < 0 ||
         (size_t)snprintf(path, sizeof(path), "%s/target/logs", root) >= sizeof(path)) {
-        set_error(error, error_size, "project root path is too long");
+        forge_util_set_error(error, error_size, "project root path is too long");
         return -1;
     }
     return create_directory(path, error, error_size);
@@ -122,7 +111,7 @@ int forge_logger_init_in(ForgeLogger *logger, const char *project_root,
 
     if (logger == NULL || kind == NULL || kind[0] == '\0' ||
         project_root == NULL || project_root[0] == '\0') {
-        set_error(error, error_size, "logger, project root, and log kind are required");
+        forge_util_set_error(error, error_size, "logger, project root, and log kind are required");
         return -1;
     }
     *logger = (ForgeLogger){0};
@@ -141,14 +130,14 @@ int forge_logger_init_in(ForgeLogger *logger, const char *project_root,
                                project_root, kind, stamp, suffix);
         }
         if (written < 0 || (size_t)written >= sizeof(logger->path)) {
-            set_error(error, error_size, "log path is too long");
+            forge_util_set_error(error, error_size, "log path is too long");
             return -1;
         }
         logger->file = fopen(logger->path, "r");
         if (logger->file == NULL) {
             logger->file = open_log_for_write(logger->path);
             if (logger->file == NULL) {
-                set_error(error, error_size, "could not create log '%s': %s",
+                forge_util_set_error(error, error_size, "could not create log '%s': %s",
                           logger->path, strerror(errno));
                 return -1;
             }
@@ -157,7 +146,7 @@ int forge_logger_init_in(ForgeLogger *logger, const char *project_root,
         (void)fclose(logger->file);
         logger->file = NULL;
     }
-    set_error(error, error_size, "could not reserve a unique log file name");
+    forge_util_set_error(error, error_size, "could not reserve a unique log file name");
     return -1;
 }
 
@@ -220,7 +209,7 @@ int forge_logger_suspend(ForgeLogger *logger, char *error, size_t error_size)
     }
     if (fflush(logger->file) != 0 || fclose(logger->file) != 0) {
         logger->file = NULL;
-        set_error(error, error_size, "could not close log '%s': %s",
+        forge_util_set_error(error, error_size, "could not close log '%s': %s",
                   logger->path, strerror(errno));
         return -1;
     }
@@ -235,7 +224,7 @@ int forge_logger_resume(ForgeLogger *logger, char *error, size_t error_size)
     }
     logger->file = open_log_for_append(logger->path);
     if (logger->file == NULL) {
-        set_error(error, error_size, "could not reopen log '%s': %s",
+        forge_util_set_error(error, error_size, "could not reopen log '%s': %s",
                   logger->path, strerror(errno));
         return -1;
     }

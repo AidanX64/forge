@@ -37,6 +37,8 @@ of raw C.)
   output layout, and build execution.
 - `src/manifest.c`, `src/compiler.c`, `src/log.c`, and `src/debug.c` provide the
   focused subsystems used by the build engine.
+- `src/forge_util.h` / `src/forge_util.c` hold small shared helpers (error
+  formatting, trimming, PATH lookups) used across modules.
 - `include/forge/` contains the interfaces between those modules.
 
 ## Building from source
@@ -76,9 +78,14 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 Or with GNU make (e.g. MSYS2 / Git Bash):
 
 ```sh
-make                    # builds build\forge.exe
-make install            # copies it to %USERPROFILE%\bin\forge.exe
+make CC=gcc          # mingw-w64 gcc; builds build/forge.exe
+make install          # copies it to %USERPROFILE%\bin\forge.exe
 ```
+
+Use the **mingw-w64** toolchain (package `mingw-w64-x86_64-gcc` on MSYS2), not
+the MSYS2 runtime's own `gcc` ports compiler — Forge expects a native Windows
+toolchain. `CC=gcc` selects it explicitly; otherwise GNU make falls back to
+its built-in `cc`.
 
 Installs to `%USERPROFILE%\bin\forge.exe` and prints the exact `PATH` command
 to run (persist it with `setx` or the `SetEnvironmentVariable` snippet it
@@ -114,6 +121,8 @@ forge run               # build (debug) and run
 forge run --release     # build (release) and run
 forge debug             # build, then launch a debugger
 forge clean             # remove the project's target/ output
+forge run --manifest path/to/Forge.toml
+                        # build another project without cd-ing into it
 ```
 
 Try it immediately against the bundled fixture:
@@ -129,6 +138,11 @@ forge run --release     # prints "Hello world!"
 Simple, Cargo-style commands (`forge run`, `forge run --release`, ...)
 replace verbose, hand-rolled Makefiles/build scripts.
 
+Incremental: already-compiled source files are skipped on rebuild (object
+files are compared against source mtimes). Tracking header dependencies is
+a future improvement, so touching an `.h` alone does not yet trigger a
+recompile.
+
 ### Cross-platform compiler dispatch
 Forge detects the host OS and version at build time and automatically
 invokes the platform's native compiler, falling back to `clang` when no
@@ -138,11 +152,45 @@ suitable native compiler is available.
 Project configuration lives in a custom manifest file, modeled on
 `Cargo.toml` — declarative, not scripted.
 
+Supported fields:
+
+```toml
+[project]
+name = "app"                 # required
+
+[sources]
+c = ["src"]                  # required: at least one of c/cpp/asm, non-empty
+cpp = []                     # optional if unused
+asm = []                     # optional if unused
+
+[targets]
+os = ["windows", "linux", "macos"]   # required
+arch = ["x86_64", "aarch64"]         # required
+
+[build]
+compiler = "clang-17"        # optional: override compiler dispatch entirely
+
+[profile.debug]
+cflags = ["-g", "-O0"]       # required
+
+[profile.release]
+cflags = ["-O2"]             # required
+```
+
+`targets.os`/`arch` list the hosts this project may build for; Forge builds
+the current host only (no cross-compilation). Assembly: GCC/Clang toolchains
+accept `.s`/`.S` sources; the MSVC-specific `.asm` dialect requires the MSVC
+toolchain (`ml64`).
+
 ### Clearer debugging
 The `debug` subcommand shells out to the target OS's native debugger
 (or a chosen third-party one) and post-processes the output into
 something more readable — e.g. a lifter-style disassembly/stack view
 instead of a raw debugger dump.
+
+Debugger selection, in order: `cdb` (Windows) → `gdb` (Windows/Linux) →
+`lldb` (macOS). Override with the `FORGE_DEBUGGER` environment variable
+(e.g. `FORGE_DEBUGGER=gdb`, `FORGE_DEBUGGER=windbg`).
 
 ### Verbose, readable logs
 All build/run/debug output is written to a `/target` directory.
