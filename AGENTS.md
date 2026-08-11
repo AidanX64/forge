@@ -51,6 +51,43 @@ as possible, regardless of target OS, architecture, or toolchain.
 - Keep `/target` log output structured enough to grep, but readable
   enough for a human skimming a failed build.
 
+## Building and Testing
+
+### Build
+- `make CC=gcc` (or `make CC=clang`) builds `build/forge[.exe]`. The Makefile
+  only defaults CC to gcc when the caller has not set it.
+- New code must compile clean under `-Wall -Wextra -Werror -std=c11`.
+- On Windows use the mingw-w64 toolchain (MSYS2 MINGW64/ucrt64 gcc); the
+  MSYS2 runtime's own `gcc` port produces the wrong target.
+
+### Test — everything is verified in `test/`
+`test/` is the canonical fixture (`test/Forge.toml`, a C project that prints
+"Hello world!"). Run it after every change so your mental model matches CI:
+
+1. `make clean && make CC=gcc` — clean full build of forge.
+2. `build/forge.exe run --release --manifest test/Forge.toml` — expect
+   `Hello world!` (Linux/macOS: `build/forge run --release`).
+3. Repeat step 2 and expect *no* recompiles — the rerun log lists
+   `up-to-date:` instead of `[compile] source:`. This is the incremental
+   regression check.
+4. `cd test && forge run` — exercises manifest discovery and
+   project-root anchoring from a plain working directory.
+
+### Incremental-build caveats
+- Objects are skipped when the source and every header the compiler recorded
+  (`-MMD -MF` depfiles, `target/{debug,release}/obj/*.d`) are older than the
+  object. Editing a `.h` recompiles only the translation units that include it.
+- Objects built by an older forge have no depfile and recompile exactly once.
+- If an incremental run ever looks wrong, force a clean build first
+  (`forge clean`, or `rm -rf build target test/target`).
+- MSVC and assembly sources have no header tracking (source mtime only);
+  MSVC is untestable on this machine, so the gcc fallback is what tests and
+  CI cover.
+
+### Diagnostics
+- Everything lands in `target/logs/`, and a failed stage also prints its last
+  log lines to stderr. Read those before rerunning or "fixing" a build.
+
 ## Scope (v1)
 
 - C/C++/assembly language support

@@ -678,12 +678,155 @@ static unsigned int source_hash(const char *text)
 }
 
 /*
- * Returns 1 when an existing object file is at least as new as its source, so
- * the compile step can be skipped. Only source mtimes are compared; header
- * dependency tracking is a later improvement (see README).
+ * Returns 1 when `path` is missing or its mtime is strictly newer than the
+ * object file, so the object is stale with respect to that dependency. A
+ * missing dependency is treated as stale (conservative): the recompile that
+ * follows either fails loudly if the file is still needed, or regenerates a
+ * correct dependency list if it is not.
  */
-static int object_is_fresh(const char *object_path, const char *source_path)
+static int dependency_is_stale(const char *path, const char *object_path)
 {
+#if FORGE_PLATFORM_WINDOWS
+    WIN32_FILE_ATTRIBUTE_DATA path_data;
+    WIN32_FILE_ATTRIBUTE_DATA object_data;
+
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &path_data) == 0 ||
+        GetFileAttributesExA(object_path, GetFileExInfoStandard, &object_data) == 0) {
+        return 1;
+    }
+    return CompareFileTime(&path_data.ftLastWriteTime, &object_data.ftLastWriteTime) > 0;
+#else
+    struct stat path_stat;
+    struct stat object_stat;
+
+    if (stat(path, &path_stat) != 0 || stat(object_path, &object_stat) != 0) {
+        return 1;
+    }
+    return path_stat.st_mtime > object_stat.st_mtime;
+#endif
+}
+
+/*
+ * Walks a gcc/clang dependency file (Makefile syntax: "target: dep dep \"
+ * "...") and returns 1 if any listed file is stale relative to the object.
+ * The paths are what the compiler itself resolved during compilation, so this
+ * tracks exactly the headers each translation unit used, including ones found
+ * through user-provided -I flags.
+ */
+static int depfile_has_stale_dependency(FILE *stream, const char *object_path)
+{
+    char token[FORGE_PATH_MAX];
+    size_t token_length = 0U;
+    int character;
+
+    while ((character = fgetc(stream)) != EOF) {
+        if (character == ':') {
+            /*
+             * The target/rule separator is the colon on the target line, which
+             * is followed by a space or a continuation backslash then a newline
+             * (e.g. `C:\...\obj.o: \` or `obj.o: dep`). A drive-letter colon
+             * (`C:\...`) is followed by more path text, so reading one char
+             * ahead tells the two apart; this matters because GCC/Clang emit
+             * drive letters here on Windows.
+             */
+            int next = fgetc(stream);
+            int separator = 0;
+
+            if (next == ' ' || next == '\t' || next == '\r' ||
+                next == '\n' || next == EOF) {
+                separator = 1;
+            } else if (next == '\\') {
+                int after_backslash = fgetc(stream);
+                if (after_backslash == '\r') {
+                    after_backslash = fgetc(stream);
+                }
+                if (after_backslash == '\n') {
+                    separator = 1;
+                } else if (after_backslash != EOF) {
+                    (void)ungetc(after_backslash, stream);
+                    (void)ungetc(next, stream);
+                    if (token_length + 1U < sizeof(token)) {
+                        token[token_length++] = (char)character;
+                    }
+                    continue;
+                }
+            } else {
+                (void)ungetc(next, stream);
+                if (token_length + 1U < sizeof(token)) {
+                    token[token_length++] = (char)character;
+                }
+                continue;
+            }
+            /* Target/rule separator colon: skip it; the dependencies follow. */
+            if (separator) {
+                continue;
+            }
+        }
+        /*
+         * A backslash at a line end is make's continuation marker; treat it as
+         * a separator rather than glue so a depfile without a space before the
+         * backslash never joins two paths into one bogus token.
+         */
+        if (character == '\\') {
+            int next = fgetc(stream);
+            if (next == '\r') {
+                next = fgetc(stream);
+            }
+            if (next == '\n') {
+                if (token_length != 0U) {
+                    token[token_length] = '\0';
+                    if (dependency_is_stale(token, object_path)) {
+                        return 1;
+                    }
+                    token_length = 0U;
+                }
+                continue;
+            }
+            if (next != EOF && token_length + 1U < sizeof(token)) {
+                token[token_length++] = (char)character;
+            }
+            if (next != EOF && ungetc(next, stream) == EOF) {
+                return 0;
+            }
+            continue;
+        }
+        if (character == ' ' || character == '\t' ||
+            character == '\r' || character == '\n') {
+            if (token_length != 0U) {
+                token[token_length] = '\0';
+                if (dependency_is_stale(token, object_path)) {
+                    return 1;
+                }
+                token_length = 0U;
+            }
+            continue;
+        }
+        if (token_length + 1U < sizeof(token)) {
+            token[token_length++] = (char)character;
+        }
+    }
+    if (token_length != 0U) {
+        token[token_length] = '\0';
+        return dependency_is_stale(token, object_path);
+    }
+    return 0;
+}
+
+/*
+ * Returns 1 when an existing object file is at least as new as both its source
+ * and (when `track_headers` is set) every header the compiler recorded for it
+ * via -MMD -MF, so the compile step can be skipped. A missing dependency file
+ * is treated as stale so the very next build regenerates it. Toolchains that
+ * write no dependency file (MSVC, and assembly sources) only compare the
+ * source mtime.
+ */
+static int object_is_fresh(const char *object_path, const char *source_path,
+                           int track_headers)
+{
+    char depfile_path[FORGE_PATH_MAX];
+    FILE *stream;
+    int fresh;
+
 #if FORGE_PLATFORM_WINDOWS
     WIN32_FILE_ATTRIBUTE_DATA object_data;
     WIN32_FILE_ATTRIBUTE_DATA source_data;
@@ -692,7 +835,9 @@ static int object_is_fresh(const char *object_path, const char *source_path)
         GetFileAttributesExA(source_path, GetFileExInfoStandard, &source_data) == 0) {
         return 0;
     }
-    return CompareFileTime(&object_data.ftLastWriteTime, &source_data.ftLastWriteTime) >= 0;
+    if (CompareFileTime(&object_data.ftLastWriteTime, &source_data.ftLastWriteTime) < 0) {
+        return 0;
+    }
 #else
     struct stat object_stat;
     struct stat source_stat;
@@ -700,8 +845,24 @@ static int object_is_fresh(const char *object_path, const char *source_path)
     if (stat(object_path, &object_stat) != 0 || stat(source_path, &source_stat) != 0) {
         return 0;
     }
-    return object_stat.st_mtime >= source_stat.st_mtime;
+    if (object_stat.st_mtime < source_stat.st_mtime) {
+        return 0;
+    }
 #endif
+    if (!track_headers) {
+        return 1;
+    }
+    if (forge_compiler_depfile_path(object_path, depfile_path,
+                                    sizeof(depfile_path)) != 0) {
+        return 0;
+    }
+    stream = fopen(depfile_path, "rb");
+    if (stream == NULL) {
+        return 0;
+    }
+    fresh = !depfile_has_stale_dependency(stream, object_path);
+    (void)fclose(stream);
+    return fresh;
 }
 
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
@@ -781,6 +942,10 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
                      host.os_name, host.version, target_os, target_arch);
     forge_logger_log(active_logger, "dispatch", "%s (%s)", compiler.selection_note,
                      forge_compiler_kind_name(compiler.kind));
+    if (compiler.kind == FORGE_COMPILER_MSVC) {
+        forge_logger_log(active_logger, "dispatch",
+                         "MSVC writes no dependency files; header edits will not trigger recompiles");
+    }
     forge_logger_log(active_logger, "compile", "----- compile %zu source file(s) -----",
                      sources.count);
     for (source_index = 0U; source_index < sources.count; ++source_index) {
@@ -791,7 +956,9 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
             print_error("object path is too long");
             goto cleanup;
         }
-        if (object_is_fresh(object_paths[source_index], source_path)) {
+        if (object_is_fresh(object_paths[source_index], source_path,
+                            compiler.kind != FORGE_COMPILER_MSVC &&
+                                sources.items[source_index].language != FORGE_SOURCE_ASM)) {
             forge_logger_log(active_logger, "compile", "up-to-date: %s", source_path);
             object_references[source_index] = object_paths[source_index];
             if (sources.items[source_index].language == FORGE_SOURCE_CPP) {

@@ -49,6 +49,15 @@ int forge_detect_host(ForgeHostInfo *host, char *error, size_t error_size);
 int forge_compiler_select(const ForgeHostInfo *host, const char *override_program,
                           ForgeCompiler *compiler, char *error, size_t error_size);
 
+/*
+ * Computes the dependency file path paired with an object file (the object
+ * path with ".o" swapped for ".d"). GCC/Clang write the headers a
+ * translation unit actually used into it via -MMD -MF, and Forge reads it
+ * back to decide whether a rebuild is still needed.
+ */
+int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
+                                size_t depfile_size);
+
 /* Builds a shell command for compiling one source file to one object file. */
 int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
                                         ForgeSourceLanguage language,

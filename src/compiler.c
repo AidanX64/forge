@@ -289,6 +289,24 @@ static const char *cpp_driver(const ForgeCompiler *compiler)
     return compiler->program;
 }
 
+int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
+                                size_t depfile_size)
+{
+    const char *dot;
+    size_t base_length;
+
+    if (object_path == NULL || depfile_path == NULL || depfile_size == 0U) {
+        return -1;
+    }
+    dot = strrchr(object_path, '.');
+    base_length = dot == NULL ? strlen(object_path) : (size_t)(dot - object_path);
+    if (base_length + 2U >= depfile_size ||
+        snprintf(depfile_path, depfile_size, "%.*s.d", (int)base_length, object_path) < 0) {
+        return -1;
+    }
+    return 0;
+}
+
 int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
                                         ForgeSourceLanguage language,
                                         const char *source_path,
@@ -349,6 +367,11 @@ int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
                              compiler->program);
         return -1;
     } else if (compiler->kind == FORGE_COMPILER_MSVC) {
+        /*
+         * MSVC has no -MMD equivalent; tracking its headers would mean
+         * parsing the localized /showIncludes output, so no dependency file
+         * is requested and freshness falls back to the source mtime only.
+         */
         if (command_append(command, command_size, &length,
                            "%s /nologo /I\"%s/include\" /c /Fo\"%s\" \"%s\"",
                            compiler->program, project_root, object_path,
@@ -357,12 +380,36 @@ int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
             return -1;
         }
     } else {
+        char depfile_path[FORGE_COMMAND_MAX];
+
         program = language == FORGE_SOURCE_CPP ? cpp_driver(compiler) : compiler->program;
-        if (command_append(command, command_size, &length,
-                           "%s -I\"%s/include\" -c \"%s\" -o \"%s\"",
-                           program, project_root, source_path, object_path) != 0) {
-            forge_util_set_error(error, error_size, "compile command is too long");
-            return -1;
+        if (language == FORGE_SOURCE_ASM) {
+            /* Plain assembly has no preprocessor includes to track. */
+            if (command_append(command, command_size, &length,
+                               "%s -I\"%s/include\" -c \"%s\" -o \"%s\"",
+                               program, project_root, source_path, object_path) != 0) {
+                forge_util_set_error(error, error_size, "compile command is too long");
+                return -1;
+            }
+        } else {
+            /*
+             * -MMD -MF has GCC/Clang write the headers this translation unit
+             * actually pulled in (system headers omitted) into a .d sibling of
+             * the object; Forge reads it back so a header edit recompiles only
+             * the files that use it.
+             */
+            if (forge_compiler_depfile_path(object_path, depfile_path,
+                                            sizeof(depfile_path)) != 0) {
+                forge_util_set_error(error, error_size, "dependency file path is too long");
+                return -1;
+            }
+            if (command_append(command, command_size, &length,
+                               "%s -I\"%s/include\" -MMD -MF\"%s\" -c \"%s\" -o \"%s\"",
+                               program, project_root, depfile_path, source_path,
+                               object_path) != 0) {
+                forge_util_set_error(error, error_size, "compile command is too long");
+                return -1;
+            }
         }
     }
 

@@ -138,10 +138,12 @@ forge run --release     # prints "Hello world!"
 Simple, Cargo-style commands (`forge run`, `forge run --release`, ...)
 replace verbose, hand-rolled Makefiles/build scripts.
 
-Incremental: already-compiled source files are skipped on rebuild (object
-files are compared against source mtimes). Tracking header dependencies is
-a future improvement, so touching an `.h` alone does not yet trigger a
-recompile.
+Incremental: already-compiled source files are skipped on rebuild. With GCC
+and Clang, Forge asks the compiler to record the headers each translation
+unit pulled in (`-MMD -MF`) and compares object mtimes against both the
+source and every listed header, so touching a `.h` recompiles exactly the
+files that use it. Toolchains that emit no dependency file (MSVC, assembly
+sources) compare source mtimes only.
 
 ### Cross-platform compiler dispatch
 Forge detects the host OS and version at build time and automatically
