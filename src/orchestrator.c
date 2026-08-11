@@ -25,6 +25,7 @@
 
 #include "forge/compiler.h"
 #include "forge/debug.h"
+#include "forge/build.h"
 #include "forge/log.h"
 #include "forge/manifest.h"
 #include "forge/orchestrator.h"
@@ -208,8 +209,8 @@ static int resolve_project_path(const char *root, const char *relative,
  * source directories, build output, and logs stay anchored to the project.
  * Returns 0 on success with the root stored in `root`.
  */
-static int compute_project_root(const char *manifest_path, char *root,
-                                size_t root_size)
+int forge_build_project_root(const char *manifest_path, char *root,
+                             size_t root_size)
 {
     char full[FORGE_PATH_MAX];
     char *separator;
@@ -656,9 +657,9 @@ static void safe_output_name(const char *project_name, char *output, size_t outp
     output[index] = '\0';
 }
 
-static int build_project(const char *project_root, const ForgeManifest *manifest,
-                         int release, int should_run,
-                         char *built_executable, size_t built_executable_size)
+int forge_build_project(const char *project_root, const ForgeManifest *manifest,
+                        int release, int should_run,
+                        char *built_executable, size_t built_executable_size)
 {
     ForgeHostInfo host;
     ForgeCompiler compiler;
@@ -809,85 +810,18 @@ cleanup:
     return result;
 }
 
-int forge_orchestrate_run(const char *manifest_path, int release)
+void forge_build_set_logger(ForgeLogger *logger)
 {
-    ForgeManifest manifest;
-    char error[FORGE_COMMAND_MAX];
-    char project_root[FORGE_PATH_MAX];
-    ForgeLogger logger;
-    int result;
-
-    if (compute_project_root(manifest_path, project_root, sizeof(project_root)) != 0) {
-        return 1;
-    }
-    if (forge_logger_init_in(&logger, project_root, "build", error, sizeof(error)) != 0) {
-        print_error("%s", error);
-        return 1;
-    }
-    active_logger = &logger;
-    forge_logger_log(active_logger, "build", "log: %s", logger.path);
-    forge_logger_log(active_logger, "parse", "----- parse manifest %s -----", manifest_path);
-    if (forge_manifest_load(manifest_path, &manifest, error, sizeof(error)) != 0) {
-        print_error("%s", error);
-        forge_logger_close(&logger);
-        active_logger = NULL;
-        return 1;
-    }
-    result = build_project(project_root, &manifest, release, 1, NULL, 0U) == 0 ? 0 : 1;
-    forge_logger_log(active_logger, "build", "result: %s", result == 0 ? "success" : "failed");
-    forge_logger_close(&logger);
-    active_logger = NULL;
-    return result;
+    active_logger = logger;
 }
 
-int forge_orchestrate_debug(const char *manifest_path, int release)
-{
-    ForgeManifest manifest;
-    char error[FORGE_COMMAND_MAX];
-    char project_root[FORGE_PATH_MAX];
-    char executable_path[FORGE_PATH_MAX];
-    ForgeLogger logger;
-    int result;
-
-    if (compute_project_root(manifest_path, project_root, sizeof(project_root)) != 0) {
-        return 1;
-    }
-    if (forge_logger_init_in(&logger, project_root, "debug", error, sizeof(error)) != 0) {
-        print_error("%s", error);
-        return 1;
-    }
-    active_logger = &logger;
-    forge_logger_log(active_logger, "debug", "log: %s", logger.path);
-    forge_logger_log(active_logger, "parse", "----- parse manifest %s -----", manifest_path);
-    if (forge_manifest_load(manifest_path, &manifest, error, sizeof(error)) != 0) {
-        print_error("%s", error);
-        forge_logger_close(&logger);
-        active_logger = NULL;
-        return 1;
-    }
-    result = build_project(project_root, &manifest, release, 0, executable_path,
-                           sizeof(executable_path)) == 0 &&
-             forge_debug_launch(executable_path, &logger, error, sizeof(error)) == 0 ? 0 : 1;
-    if (result != 0 && error[0] != '\0') {
-        print_error("%s", error);
-    }
-    forge_logger_log(active_logger, "debug", "result: %s",
-                     result == 0 ? "success" : "failed");
-    forge_logger_close(&logger);
-    active_logger = NULL;
-    return result;
-}
-
-/*
- * Removes the project's target/ directory (build output and logs). The target
- * path is anchored to the manifest directory, matching build behavior.
- */
-int forge_orchestrate_clean(const char *manifest_path)
+/* Removes the project's target/ directory, anchored to its manifest. */
+int forge_build_clean(const char *manifest_path)
 {
     char project_root[FORGE_PATH_MAX];
     char target_path[FORGE_PATH_MAX];
 
-    if (compute_project_root(manifest_path, project_root, sizeof(project_root)) != 0) {
+    if (forge_build_project_root(manifest_path, project_root, sizeof(project_root)) != 0) {
         return 1;
     }
     if (resolve_project_path(project_root, "target", target_path, sizeof(target_path)) != 0) {

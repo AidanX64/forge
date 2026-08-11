@@ -11,8 +11,7 @@ static void print_usage(FILE *stream)
             "Usage:\n"
             "  forge run [--release] [--manifest PATH]\n"
             "  forge debug [--release] [--manifest PATH]\n"
-            "  forge clean [--manifest PATH]\n"
-            "  forge runner ...\n");
+            "  forge clean [--manifest PATH]\n");
 }
 
 int forge_cli_main(int argc, char **argv)

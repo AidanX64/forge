@@ -1,9 +1,9 @@
 # Forge
 
-A package manager and automated build system for **C, C++, and Assembly**.
+A build orchestration system for **C, C++, and Assembly**.
 
-Forge exists to kill three problems: dependency hell, verbose hand-written
-build scripts, and painful cross-platform / cross-architecture compilation.
+Forge exists to eliminate verbose hand-written build scripts and painful
+cross-platform / cross-architecture compilation.
 The goal is a build UX as simple as:
 
 ```sh
@@ -14,9 +14,9 @@ regardless of target OS, architecture, or toolchain.
 
 ## Philosophy
 
-Forge takes heavy inspiration from **Cargo** (Rust's package manager) —
-same ergonomics, same "it just works" feel — applied to a language
-ecosystem that has never really had it.
+Forge takes heavy inspiration from **Cargo** — the same ergonomic,
+"it just works" feel applied to a language ecosystem that has never really
+had it.
 
 Implementation language rules for Forge itself:
 
@@ -28,6 +28,16 @@ Implementation language rules for Forge itself:
 
 (Rust was considered for implementing Forge itself, but dropped in favor
 of raw C.)
+
+## Project layout
+
+- `src/cli.c` parses command-line arguments.
+- `src/commands.c` owns `run`, `debug`, and `clean` invocation lifecycles.
+- `src/orchestrator.c` is the build engine: source discovery, compiler dispatch,
+  output layout, and build execution.
+- `src/manifest.c`, `src/compiler.c`, `src/log.c`, and `src/debug.c` provide the
+  focused subsystems used by the build engine.
+- `include/forge/` contains the interfaces between those modules.
 
 ## Building from source
 
@@ -128,17 +138,6 @@ suitable native compiler is available.
 Project configuration lives in a custom manifest file, modeled on
 `Cargo.toml` — declarative, not scripted.
 
-### Parallel multi-platform runners
-Build/test runners can run in parallel across heterogeneous machines:
-native or cloud, VM or bare metal, communicating over raw TCP. The
-runner pool is assumed heterogeneous (mixed OS/arch/GPU), not a
-uniform fleet.
-
-Graphics programming was a core consideration from day one, not an
-afterthought — runner machines with a **real GPU and a monitor** are
-preferred over headless boxes, since graphics-program builds need to
-actually render to be verified.
-
 ### Clearer debugging
 The `debug` subcommand shells out to the target OS's native debugger
 (or a chosen third-party one) and post-processes the output into
@@ -152,21 +151,14 @@ not just machine-parsed.
 
 ## Scope
 
-**v1 is build orchestration only.** Dependency fetching and package
-management are explicitly **out of scope for v1** — Forge behaves as a
-build system first; the "package manager" ambitions come later.
-
-## Non-Goals (for now)
-
-- Dependency/package fetching and resolution
-- Support for languages other than C, C++, and Assembly
+**v1 is build orchestration only.** Forge supports C, C++, and Assembly.
 
 ## Status
 
 v1 build orchestration is implemented and working: `forge run`,
 `forge run --release`, and `forge debug` build, link, log, and execute on the
 host. Compiler dispatch, manifest parsing, and per-invocation `target/logs`
-are in place. Dependency fetching and the TCP runner pool are planned next.
+are in place.
 
 ## Author note 
 

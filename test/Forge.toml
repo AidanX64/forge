@@ -1,0 +1,17 @@
+[project]
+name = "hello"
+
+[sources]
+c = ["src"]
+cpp = []
+asm = []
+
+[targets]
+os = ["windows", "linux", "macos"]
+arch = ["x86_64", "aarch64"]
+
+[profile.debug]
+cflags = ["-g", "-O0"]
+
+[profile.release]
+cflags = ["-O2"]

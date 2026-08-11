@@ -8,7 +8,7 @@ back-and-forth.
 
 ## 1. Scaffold
 
-Set up a C project called Forge (build system/package manager for
+Set up a C project called Forge (build orchestration system for
 C/C++/assembly). Use a plain Makefile bootstrap (no CMake — Forge
 should eventually build itself). Directory layout: `src/`, `include/`,
 `target/` (build output + logs, gitignored). Strict C compile flags
@@ -67,22 +67,4 @@ native debugger (or a configurable third-party one) and
 post-processes its output into a clearer, lifter-style
 disassembly/stack view instead of dumping raw debugger output.
 
----
-
-## 7. TCP runner protocol
-
-Design the raw-TCP protocol for Forge's parallel multi-platform
-runners (native/cloud, VM/bare metal, heterogeneous OS+arch+GPU pool
-— don't assume a uniform fleet). Define message types for: register
-runner, dispatch build job, stream logs back, report result.
-Implement a minimal runner daemon and a coordinator that can dispatch
-one job to one connected runner end-to-end.
-
----
-
-## 8. GPU-aware runner selection
-
-Extend the runner coordinator to tag runners by GPU/display presence
-and let a build job request "needs GPU + display" (for
-graphics-program verification builds) vs any runner. Route jobs
-accordingly.
+This completes the initial v1 build plan.
