@@ -5,22 +5,6 @@ LDLIBS ?=
 
 TARGET_DIR := build
 
-ifeq ($(OS),Windows_NT)
-EXE := .exe
-PREFIX ?= $(USERPROFILE)/bin
-define make_directory
-cmd /C if not exist "$(1)" mkdir "$(1)"
-endef
-define remove_directory
-cmd /C if exist "$(1)" rmdir /S /Q "$(1)"
-endef
-define install_binary
-cmd /C copy /Y "$(1)" "$(2)" >NUL
-endef
-define remove_file
-cmd /C if exist "$(1)" del /Q "$(1)"
-endef
-else
 EXE :=
 PREFIX ?= $(HOME)/.local/bin
 define make_directory
@@ -35,6 +19,28 @@ endef
 define remove_file
 rm -f "$(1)"
 endef
+
+ifeq ($(OS),Windows_NT)
+EXE := .exe
+PREFIX ?= $(USERPROFILE)/bin
+
+# Select recipes by shell: MSYS2/Git Bash make runs under a POSIX shell
+# (/bin/sh -> commands behave), while native Windows Make uses a bare
+# sh.exe/cmd.exe with no Unix path and needs cmd /C.
+ifeq (,$(findstring /,$(SHELL)))
+define make_directory
+cmd /C if not exist "$(1)" mkdir "$(1)"
+endef
+define remove_directory
+cmd /C if exist "$(1)" rmdir /S /Q "$(1)"
+endef
+define install_binary
+cmd /C copy /Y "$(1)" "$(2)" >NUL
+endef
+define remove_file
+cmd /C if exist "$(1)" del /Q "$(1)"
+endef
+endif
 endif
 
 BIN := $(TARGET_DIR)/forge$(EXE)
