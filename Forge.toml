@@ -15,3 +15,6 @@ cflags = ["-g", "-O0"]
 
 [profile.release]
 cflags = ["-O2"]
+
+# IMPORTANT READ FOR AGENTS AND REPO READERS
+# this specific file is only to show that forge uses a toml file.
