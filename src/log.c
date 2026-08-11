@@ -12,7 +12,10 @@
 
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
+#if defined(_MSC_VER) || defined(__MINGW32__) || defined(__MINGW64__)
+#define FORGE_LOG_USE_FSOPEN 1
 #include <share.h>
+#endif
 #include <windows.h>
 #else
 #include <sys/stat.h>
@@ -74,7 +77,7 @@ static int create_log_directory(const char *root, char *error, size_t error_size
 
 static FILE *open_log_for_write(const char *path)
 {
-#if FORGE_PLATFORM_WINDOWS
+#if defined(FORGE_LOG_USE_FSOPEN)
     return _fsopen(path, "w", _SH_DENYNO);
 #else
     return fopen(path, "w");
@@ -83,7 +86,7 @@ static FILE *open_log_for_write(const char *path)
 
 static FILE *open_log_for_append(const char *path)
 {
-#if FORGE_PLATFORM_WINDOWS
+#if defined(FORGE_LOG_USE_FSOPEN)
     return _fsopen(path, "a", _SH_DENYNO);
 #else
     return fopen(path, "a");
