@@ -8,7 +8,9 @@
 #include <string.h>
 #include <time.h>
 
-#ifdef _WIN32
+#include "forge/platform.h"
+
+#if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <share.h>
 #include <windows.h>
@@ -33,7 +35,7 @@ static void set_error(char *error, size_t error_size, const char *format, ...)
 
 static int create_directory(const char *path, char *error, size_t error_size)
 {
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     if (CreateDirectoryA(path, NULL) == 0 &&
         GetLastError() != ERROR_ALREADY_EXISTS) {
         set_error(error, error_size, "could not create output directory '%s' (error %lu)",
@@ -72,7 +74,7 @@ static int create_log_directory(const char *root, char *error, size_t error_size
 
 static FILE *open_log_for_write(const char *path)
 {
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     return _fsopen(path, "w", _SH_DENYNO);
 #else
     return fopen(path, "w");
@@ -81,7 +83,7 @@ static FILE *open_log_for_write(const char *path)
 
 static FILE *open_log_for_append(const char *path)
 {
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     return _fsopen(path, "a", _SH_DENYNO);
 #else
     return fopen(path, "a");
@@ -90,7 +92,7 @@ static FILE *open_log_for_append(const char *path)
 
 static void timestamp(char *value, size_t value_size)
 {
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     SYSTEMTIME now;
     GetLocalTime(&now);
     (void)snprintf(value, value_size, "%04u%02u%02u-%02u%02u%02u-%03u",

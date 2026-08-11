@@ -6,6 +6,7 @@
 
 #include "forge/compiler.h"
 #include "forge/debug.h"
+#include "forge/platform.h"
 
 #define FORGE_DEBUG_COMMAND_MAX 8192U
 #define FORGE_DEBUG_LINE_MAX 4096U
@@ -27,7 +28,7 @@ static int program_available(const char *program)
     char command[FORGE_COMPILER_VALUE_MAX * 2U];
     int written;
 
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     written = snprintf(command, sizeof(command), "where \"%s\" >NUL 2>&1", program);
 #else
     written = snprintf(command, sizeof(command), "command -v \"%s\" >/dev/null 2>&1",

@@ -1,4 +1,6 @@
-#if !defined(_WIN32)
+#include "forge/platform.h"
+
+#if !FORGE_PLATFORM_WINDOWS
 #define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
 #endif
@@ -14,7 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #else
@@ -178,7 +180,7 @@ static int path_join(char *destination, size_t destination_size,
 
 static int is_absolute_path(const char *path)
 {
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     return (isalpha((unsigned char)path[0]) && path[1] == ':') ||
            path[0] == '/' || path[0] == '\\';
 #else
@@ -216,7 +218,7 @@ int forge_build_project_root(const char *manifest_path, char *root,
     char full[FORGE_PATH_MAX];
     char *separator;
 
-#if defined(_WIN32)
+#if FORGE_PLATFORM_WINDOWS
     {
         DWORD length = GetFullPathNameA(manifest_path, sizeof(full), full, NULL);
         if (length == 0U || length >= sizeof(full)) {
@@ -238,7 +240,7 @@ int forge_build_project_root(const char *manifest_path, char *root,
         return -1;
     }
     separator = strrchr(full, '/');
-#if defined(_WIN32)
+#if FORGE_PLATFORM_WINDOWS
     {
         char *backslash = strrchr(full, '\\');
         if (backslash != NULL && backslash > separator) {
@@ -320,7 +322,7 @@ static void source_list_free(ForgeSourceList *sources)
     *sources = (ForgeSourceList){0};
 }
 
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
 static int collect_sources_recursive(const char *directory, ForgeSourceLanguage language,
                                      ForgeSourceList *sources)
 {
@@ -473,7 +475,7 @@ static int ensure_directory(const char *path)
         {
             char saved = current[index];
             current[index] = '\0';
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
             if (CreateDirectoryA(current, NULL) == 0 &&
                 GetLastError() != ERROR_ALREADY_EXISTS) {
                 print_error("could not create output directory '%s' (error %lu)", current,
@@ -493,7 +495,7 @@ static int ensure_directory(const char *path)
     return 0;
 }
 
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
 static int remove_tree(const char *path)
 {
     WIN32_FIND_DATAA entry;
@@ -669,6 +671,7 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     const char *target_os;
     const char *target_arch;
     char error[FORGE_COMMAND_MAX] = {0};
+    char target_directory[FORGE_PATH_MAX];
     char profile_directory[FORGE_PATH_MAX];
     char object_directory[FORGE_PATH_MAX];
     char executable_name[FORGE_MANIFEST_VALUE_MAX];
@@ -700,9 +703,9 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     for (flag_index = 0U; flag_index < profile->cflags.count; ++flag_index) {
         flags[flag_index] = profile->cflags.items[flag_index];
     }
-    if (resolve_project_path(project_root, "target", profile_directory,
-                             sizeof(profile_directory)) != 0 ||
-        path_join(profile_directory, sizeof(profile_directory), profile_directory,
+    if (resolve_project_path(project_root, "target", target_directory,
+                             sizeof(target_directory)) != 0 ||
+        path_join(profile_directory, sizeof(profile_directory), target_directory,
                   release ? "release" : "debug") != 0 ||
         path_join(object_directory, sizeof(object_directory), profile_directory, "obj") != 0) {
         print_error("output path is too long");
@@ -712,7 +715,7 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
         goto cleanup;
     }
     safe_output_name(manifest->project_name, executable_name, sizeof(executable_name));
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     if (snprintf(executable_path, sizeof(executable_path), "%s/%s.exe",
                  profile_directory, executable_name) < 0 ||
         strlen(profile_directory) + strlen(executable_name) + 5U >= sizeof(executable_path)) {
@@ -787,7 +790,7 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
         goto cleanup;
     }
     forge_logger_log(active_logger, "run", "----- run %s -----", executable_path);
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     if (snprintf(command, sizeof(command), "cmd /C \"\"%s\"\"", executable_path) < 0 ||
         strlen(executable_path) + 13U >= sizeof(command)) {
 #else

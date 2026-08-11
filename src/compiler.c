@@ -3,7 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifdef _WIN32
+#include "forge/platform.h"
+
+#if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 /*
@@ -84,7 +86,7 @@ static int program_available(const char *program)
     char command[FORGE_COMPILER_VALUE_MAX * 2U];
     int written;
 
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     written = snprintf(command, sizeof(command), "where \"%s\" >NUL 2>&1", program);
 #else
     written = snprintf(command, sizeof(command), "command -v \"%s\" >/dev/null 2>&1",
@@ -143,7 +145,7 @@ int forge_detect_host(ForgeHostInfo *host, char *error, size_t error_size)
     }
     *host = (ForgeHostInfo){0};
 
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     {
         ForgeRtlOsVersionInfo version = {0};
         version.dwOSVersionInfoSize = sizeof(version);
@@ -217,7 +219,7 @@ static int select_program(const char *program, ForgeCompilerKind kind, int fallb
  */
 static int msvc_environment_ready(void)
 {
-#ifdef _WIN32
+#if FORGE_PLATFORM_WINDOWS
     const char *include = getenv("INCLUDE");
     return include != NULL && include[0] != '\0';
 #else
