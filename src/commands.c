@@ -52,6 +52,26 @@ int forge_orchestrate_run(const char *manifest_path, int release)
     return result;
 }
 
+int forge_orchestrate_build(const char *manifest_path, int release)
+{
+    ForgeManifest manifest;
+    ForgeLogger logger = {0};
+    char root[FORGE_PATH_MAX];
+    char executable[FORGE_PATH_MAX];
+    int result;
+
+    if (load_invocation(manifest_path, "build", &logger, &manifest, root, sizeof(root)) != 0) {
+        finish_invocation(&logger);
+        return 1;
+    }
+    result = forge_build_project(root, &manifest, release, 0, executable, sizeof(executable)) == 0
+                 ? 0
+                 : 1;
+    forge_logger_log(&logger, "build", "result: %s", result == 0 ? "success" : "failed");
+    finish_invocation(&logger);
+    return result;
+}
+
 int forge_orchestrate_debug(const char *manifest_path, int release)
 {
     ForgeManifest manifest;
