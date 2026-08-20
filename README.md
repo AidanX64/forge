@@ -62,10 +62,10 @@ make test               # builds and runs `forge --help`
 
 ```sh
 # Linux / macOS
-gcc -Wall -Wextra -Werror -std=c23 -Iinclude src/*.c -o build/forge
+gcc -Wall -Wextra -Werror -std=c2x -Iinclude src/*.c -o build/forge
 
 # Windows
-gcc -Wall -Wextra -Werror -std=c23 -Iinclude src/*.c -o build\forge.exe
+gcc -Wall -Wextra -Werror -std=c2x -Iinclude src/*.c -o build\forge.exe
 ```
 
 ## Installation

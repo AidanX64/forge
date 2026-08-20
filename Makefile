@@ -3,7 +3,7 @@
 ifeq ($(origin CC),default)
 CC := gcc
 endif
-CFLAGS ?= -Wall -Wextra -Werror -std=c23 -Iinclude
+CFLAGS ?= -Wall -Wextra -Werror -std=c2x -Iinclude
 LDFLAGS ?=
 LDLIBS ?=
 

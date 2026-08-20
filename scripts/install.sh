@@ -23,7 +23,7 @@ else
 fi
 
 mkdir -p "$build_dir" "$prefix"
-$compiler -Wall -Wextra -Werror -std=c23 -I"$root/include" "$root"/src/*.c -o "$exe"
+$compiler -Wall -Wextra -Werror -std=c2x -I"$root/include" "$root"/src/*.c -o "$exe"
 cp "$exe" "$installed"
 chmod +x "$installed"
 
