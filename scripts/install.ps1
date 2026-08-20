@@ -21,7 +21,7 @@ if (Get-Command gcc -ErrorAction SilentlyContinue) {
 New-Item -ItemType Directory -Force -Path $buildDir | Out-Null
 $sources = Get-ChildItem (Join-Path $root 'src') -Filter '*.c' | ForEach-Object { $_.FullName }
 
-& $compiler -Wall -Wextra -Werror -std=c11 "-I$(Join-Path $root 'include')" $sources -o $builtExe
+& $compiler -Wall -Wextra -Werror -std=c23 "-I$(Join-Path $root 'include')" $sources -o $builtExe
 if ($LASTEXITCODE -ne 0) {
     Write-Host "error: build failed" -ForegroundColor Red
     exit $LASTEXITCODE

@@ -56,7 +56,8 @@ as possible, regardless of target OS, architecture, or toolchain.
 ### Build
 - `make CC=gcc` (or `make CC=clang`) builds `build/forge[.exe]`. The Makefile
   only defaults CC to gcc when the caller has not set it.
-- New code must compile clean under `-Wall -Wextra -Werror -std=c11`.
+- New code must compile clean under `-Wall -Wextra -Werror -std=c23`
+  (requires GCC >= 14 or Clang >= 16).
 - On Windows use the mingw-w64 toolchain (MSYS2 MINGW64/ucrt64 gcc); the
   MSYS2 runtime's own `gcc` port produces the wrong target.
 
