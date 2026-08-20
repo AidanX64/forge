@@ -3,12 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "forge/argv.h"
 #include "forge/compiler.h"
 #include "forge/debug.h"
 #include "forge/platform.h"
+#include "forge/process.h"
 #include "forge_util.h"
 
-#define FORGE_DEBUG_COMMAND_MAX 8192U
 #define FORGE_DEBUG_LINE_MAX 4096U
 
 static int select_debugger(const ForgeHostInfo *host, char *program, size_t program_size,
@@ -17,11 +18,6 @@ static int select_debugger(const ForgeHostInfo *host, char *program, size_t prog
     const char *override = getenv("FORGE_DEBUGGER");
 
     if (override != NULL && override[0] != '\0') {
-        if (forge_util_has_shell_unsafe_chars(override)) {
-            forge_util_set_error(error, error_size,
-                                 "FORGE_DEBUGGER contains characters unsafe for shell invocation");
-            return -1;
-        }
         if (!forge_util_program_available(override)) {
             forge_util_set_error(error, error_size,
                       "FORGE_DEBUGGER='%s' is not available on PATH", override);
@@ -50,30 +46,46 @@ static int select_debugger(const ForgeHostInfo *host, char *program, size_t prog
     return -1;
 }
 
-static int make_debug_command(const char *program, const char *executable_path,
-                              char *command, size_t command_size,
-                              char *error, size_t error_size)
+/* Builds the argv that runs the chosen debugger in batch mode. */
+static int make_debug_argv(const char *program, const char *executable_path,
+                           ForgeArgv *argv, char *error, size_t error_size)
 {
-    int written;
-
     if (strcmp(program, "cdb") == 0) {
-        written = snprintf(command, command_size,
-                           "cdb -lines -c \"g; k; u @rip L20; q\" \"%s\"",
-                           executable_path);
+        if (forge_argv_append(argv, "cdb") != 0 ||
+            forge_argv_append(argv, "-lines") != 0 ||
+            forge_argv_append(argv, "-c") != 0 ||
+            forge_argv_append(argv, "g; k; u @rip L20; q") != 0 ||
+            forge_argv_append(argv, executable_path) != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building debugger command");
+            return -1;
+        }
     } else if (strcmp(program, "lldb") == 0) {
-        written = snprintf(command, command_size,
-                           "lldb --batch -o \"run\" -o \"bt\" "
-                           "-o \"disassemble -n main\" \"%s\"",
-                           executable_path);
+        if (forge_argv_append(argv, "lldb") != 0 ||
+            forge_argv_append(argv, "--batch") != 0 ||
+            forge_argv_append(argv, "-o") != 0 ||
+            forge_argv_append(argv, "run") != 0 ||
+            forge_argv_append(argv, "-o") != 0 ||
+            forge_argv_append(argv, "bt") != 0 ||
+            forge_argv_append(argv, "-o") != 0 ||
+            forge_argv_append(argv, "disassemble -n main") != 0 ||
+            forge_argv_append(argv, executable_path) != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building debugger command");
+            return -1;
+        }
     } else {
-        written = snprintf(command, command_size,
-                           "%s --batch -q -ex \"run\" -ex \"bt\" "
-                           "-ex \"disassemble /m main\" \"%s\"",
-                           program, executable_path);
-    }
-    if (written < 0 || (size_t)written >= command_size) {
-        forge_util_set_error(error, error_size, "debugger command is too long");
-        return -1;
+        if (forge_argv_append(argv, program) != 0 ||
+            forge_argv_append(argv, "--batch") != 0 ||
+            forge_argv_append(argv, "-q") != 0 ||
+            forge_argv_append(argv, "-ex") != 0 ||
+            forge_argv_append(argv, "run") != 0 ||
+            forge_argv_append(argv, "-ex") != 0 ||
+            forge_argv_append(argv, "bt") != 0 ||
+            forge_argv_append(argv, "-ex") != 0 ||
+            forge_argv_append(argv, "disassemble /m main") != 0 ||
+            forge_argv_append(argv, executable_path) != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building debugger command");
+            return -1;
+        }
     }
     return 0;
 }
@@ -128,9 +140,10 @@ int forge_debug_launch(const char *executable_path, ForgeLogger *logger,
 {
     ForgeHostInfo host;
     char debugger[FORGE_COMPILER_VALUE_MAX];
-    char command[FORGE_DEBUG_COMMAND_MAX];
+    ForgeArgv argv = {0};
     char raw_path[FORGE_LOG_PATH_MAX + 8U];
-    char captured_command[FORGE_DEBUG_COMMAND_MAX + FORGE_LOG_PATH_MAX + 32U];
+    char display[FORGE_LOG_PATH_MAX + 512U];
+    int exit_code = 0;
     int written;
 
     if (executable_path == NULL || executable_path[0] == '\0' || logger == NULL) {
@@ -139,24 +152,27 @@ int forge_debug_launch(const char *executable_path, ForgeLogger *logger,
     }
     if (forge_detect_host(&host, error, error_size) != 0 ||
         select_debugger(&host, debugger, sizeof(debugger), error, error_size) != 0 ||
-        make_debug_command(debugger, executable_path, command, sizeof(command),
-                           error, error_size) != 0) {
+        make_debug_argv(debugger, executable_path, &argv, error, error_size) != 0) {
+        forge_argv_free(&argv);
         return -1;
     }
     written = snprintf(raw_path, sizeof(raw_path), "%s.raw", logger->path);
     if (written < 0 || (size_t)written >= sizeof(raw_path)) {
         forge_util_set_error(error, error_size, "raw debugger transcript path is too long");
+        forge_argv_free(&argv);
         return -1;
     }
     forge_logger_log(logger, "debug", "debugger=%s executable=%s", debugger, executable_path);
-    forge_logger_log(logger, "debug", "command: %s", command);
-    written = snprintf(captured_command, sizeof(captured_command),
-                       "%s > \"%s\" 2>&1", command, raw_path);
-    if (written < 0 || (size_t)written >= sizeof(captured_command)) {
-        forge_util_set_error(error, error_size, "debugger command is too long to capture");
+    if (forge_argv_join(display, sizeof(display), &argv) == 0) {
+        forge_logger_log(logger, "debug", "command: %s", display);
+    }
+    (void)forge_argv_finalize(&argv);
+    if (forge_process_run(argv.items, raw_path, 0, &exit_code, error, error_size) != 0) {
+        forge_argv_free(&argv);
         return -1;
     }
-    if (system(captured_command) != 0) {
+    forge_argv_free(&argv);
+    if (exit_code != 0) {
         forge_logger_error(logger, "debug",
                            "debugger exited with an error; processing its transcript");
     }

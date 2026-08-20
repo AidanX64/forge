@@ -35,7 +35,7 @@ static void finish_invocation(ForgeLogger *logger)
     forge_build_set_logger(NULL);
 }
 
-int forge_orchestrate_run(const char *manifest_path, int release)
+int forge_orchestrate_run(const char *manifest_path, int release, int max_jobs)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
@@ -46,13 +46,13 @@ int forge_orchestrate_run(const char *manifest_path, int release)
         finish_invocation(&logger);
         return 1;
     }
-    result = forge_build_project(root, &manifest, release, 1, NULL, 0U) == 0 ? 0 : 1;
+    result = forge_build_project(root, &manifest, release, 1, max_jobs, NULL, 0U) == 0 ? 0 : 1;
     forge_logger_log(&logger, "build", "result: %s", result == 0 ? "success" : "failed");
     finish_invocation(&logger);
     return result;
 }
 
-int forge_orchestrate_build(const char *manifest_path, int release)
+int forge_orchestrate_build(const char *manifest_path, int release, int max_jobs)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
@@ -64,15 +64,14 @@ int forge_orchestrate_build(const char *manifest_path, int release)
         finish_invocation(&logger);
         return 1;
     }
-    result = forge_build_project(root, &manifest, release, 0, executable, sizeof(executable)) == 0
-                 ? 0
-                 : 1;
+    result = forge_build_project(root, &manifest, release, 0, max_jobs,
+                                 executable, sizeof(executable)) == 0 ? 0 : 1;
     forge_logger_log(&logger, "build", "result: %s", result == 0 ? "success" : "failed");
     finish_invocation(&logger);
     return result;
 }
 
-int forge_orchestrate_debug(const char *manifest_path, int release)
+int forge_orchestrate_debug(const char *manifest_path, int release, int max_jobs)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
@@ -85,7 +84,8 @@ int forge_orchestrate_debug(const char *manifest_path, int release)
         finish_invocation(&logger);
         return 1;
     }
-    result = forge_build_project(root, &manifest, release, 0, executable, sizeof(executable)) == 0 &&
+    result = forge_build_project(root, &manifest, release, 0, max_jobs,
+                                 executable, sizeof(executable)) == 0 &&
              forge_debug_launch(executable, &logger, error, sizeof(error)) == 0 ? 0 : 1;
     if (result != 0 && error[0] != '\0') {
         forge_logger_error(&logger, "debug", "%s", error);

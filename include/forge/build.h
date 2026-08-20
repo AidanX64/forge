@@ -10,7 +10,7 @@
 void forge_build_set_logger(ForgeLogger *logger);
 int forge_build_project_root(const char *manifest_path, char *root, size_t root_size);
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
-                        int release, int should_run,
+                        int release, int should_run, int max_jobs,
                         char *built_executable, size_t built_executable_size);
 int forge_build_clean(const char *manifest_path);
 

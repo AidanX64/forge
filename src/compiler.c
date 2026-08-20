@@ -49,26 +49,11 @@ static LONG rtl_get_version(ForgeRtlOsVersionInfo *version)
 #endif
 
 #include "forge/compiler.h"
+#include "forge/flags.h"
+#include "forge/process.h"
 #include "forge_util.h"
 
-static int command_append(char *command, size_t command_size, size_t *length,
-                          const char *format, ...)
-{
-    va_list arguments;
-    int written;
-
-    if (*length >= command_size) {
-        return -1;
-    }
-    va_start(arguments, format);
-    written = vsnprintf(command + *length, command_size - *length, format, arguments);
-    va_end(arguments);
-    if (written < 0 || (size_t)written >= command_size - *length) {
-        return -1;
-    }
-    *length += (size_t)written;
-    return 0;
-}
+#define FORGE_PATH_MAX_LOCAL 1024U
 
 static ForgeCompilerKind compiler_kind_from_program(const char *program)
 {
@@ -81,14 +66,6 @@ static ForgeCompilerKind compiler_kind_from_program(const char *program)
     return FORGE_COMPILER_GCC;
 }
 
-static int has_suffix(const char *text, const char *suffix)
-{
-    size_t text_length = strlen(text);
-    size_t suffix_length = strlen(suffix);
-
-    return text_length >= suffix_length &&
-           strcmp(text + text_length - suffix_length, suffix) == 0;
-}
 
 const char *forge_host_os_name(ForgeHostOs os)
 {
@@ -229,11 +206,6 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
     *compiler = (ForgeCompiler){0};
 
     if (override_program != NULL && override_program[0] != '\0') {
-        if (forge_util_has_shell_unsafe_chars(override_program)) {
-            forge_util_set_error(error, error_size,
-                                 "compiler override contains characters unsafe for shell invocation");
-            return -1;
-        }
         return select_program(override_program, compiler_kind_from_program(override_program),
                               0, "using manifest compiler override", compiler,
                               error, error_size);
@@ -307,25 +279,28 @@ int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
     return 0;
 }
 
-int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
-                                        ForgeSourceLanguage language,
-                                        const char *source_path,
-                                        const char *object_path,
-                                        const char *project_root,
-                                        const char *target_os,
-                                        const char *target_arch,
-                                        const char *const *flags, size_t flag_count,
-                                        char *command, size_t command_size,
-                                        char *error, size_t error_size)
+int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
+                                     ForgeSourceLanguage language,
+                                     const char *source_path,
+                                     const char *object_path,
+                                     const char *project_root,
+                                     const char *target_os,
+                                     const char *target_arch,
+                                     const ForgeBuildProfile *profile,
+                                     ForgeArgv *argv,
+                                     char *error, size_t error_size)
 {
     const char *program;
-    size_t index;
-    size_t length = 0U;
+    char depfile_path[FORGE_PATH_MAX_LOCAL];
 
     if (compiler == NULL || source_path == NULL || object_path == NULL ||
         project_root == NULL || target_os == NULL || target_arch == NULL ||
-        command == NULL || command_size == 0U) {
-        forge_util_set_error(error, error_size, "compiler, paths, target, and command output are required");
+        profile == NULL || argv == NULL) {
+        forge_util_set_error(error, error_size, "compiler, paths, target, profile, and argv output are required");
+        return -1;
+    }
+    if (argv->count != 0U) {
+        forge_util_set_error(error, error_size, "compile argv output must be empty");
         return -1;
     }
     if (source_path[0] == '\0' || object_path[0] == '\0' || project_root[0] == '\0' ||
@@ -333,30 +308,24 @@ int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
         forge_util_set_error(error, error_size, "source, object, project root, target OS, and target architecture are required");
         return -1;
     }
-    command[0] = '\0';
-
-    if (forge_util_has_shell_unsafe_chars(compiler->program) ||
-        forge_util_has_shell_unsafe_chars(project_root) ||
-        forge_util_has_shell_unsafe_chars(source_path) ||
-        forge_util_has_shell_unsafe_chars(object_path)) {
-        forge_util_set_error(error, error_size,
-                             "compiler or paths contain characters unsafe for shell invocation");
-        return -1;
-    }
 
     if (compiler->kind == FORGE_COMPILER_MSVC && language == FORGE_SOURCE_ASM) {
         program = strcmp(target_arch, "x86_64") == 0 ? "ml64" : "ml";
         if (!forge_util_program_available(program)) {
             forge_util_set_error(error, error_size, "MSVC assembly requires '%s' on PATH", program);
+            forge_argv_free(argv);
             return -1;
         }
-        if (command_append(command, command_size, &length,
-                           "%s /nologo /c /Fo\"%s\" \"%s\"",
-                           program, object_path, source_path) != 0) {
-            forge_util_set_error(error, error_size, "compile command is too long");
+        if (forge_argv_append(argv, program) != 0 ||
+            forge_argv_append(argv, "/nologo") != 0 ||
+            forge_argv_append(argv, "/c") != 0 ||
+            forge_argv_appendf(argv, "/Fo%s", object_path) != 0 ||
+            forge_argv_append(argv, source_path) != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building compile command");
+            forge_argv_free(argv);
             return -1;
         }
-    } else if (language == FORGE_SOURCE_ASM && has_suffix(source_path, ".asm")) {
+    } else if (language == FORGE_SOURCE_ASM && forge_util_has_suffix(source_path, ".asm")) {
         /*
          * GCC/Clang drive the source with their own assembler, which
          * understands .s/.S but not the MSVC-flavoured .asm dialect.
@@ -372,23 +341,28 @@ int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
          * parsing the localized /showIncludes output, so no dependency file
          * is requested and freshness falls back to the source mtime only.
          */
-        if (command_append(command, command_size, &length,
-                           "%s /nologo /I\"%s/include\" /c /Fo\"%s\" \"%s\"",
-                           compiler->program, project_root, object_path,
-                           source_path) != 0) {
-            forge_util_set_error(error, error_size, "compile command is too long");
+        if (forge_argv_append(argv, compiler->program) != 0 ||
+            forge_argv_append(argv, "/nologo") != 0 ||
+            forge_argv_appendf(argv, "/I%s/include", project_root) != 0 ||
+            forge_argv_append(argv, "/c") != 0 ||
+            forge_argv_appendf(argv, "/Fo%s", object_path) != 0 ||
+            forge_argv_append(argv, source_path) != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building compile command");
+            forge_argv_free(argv);
             return -1;
         }
     } else {
-        char depfile_path[FORGE_COMMAND_MAX];
-
         program = language == FORGE_SOURCE_CPP ? cpp_driver(compiler) : compiler->program;
         if (language == FORGE_SOURCE_ASM) {
             /* Plain assembly has no preprocessor includes to track. */
-            if (command_append(command, command_size, &length,
-                               "%s -I\"%s/include\" -c \"%s\" -o \"%s\"",
-                               program, project_root, source_path, object_path) != 0) {
-                forge_util_set_error(error, error_size, "compile command is too long");
+            if (forge_argv_append(argv, program) != 0 ||
+                forge_argv_appendf(argv, "-I%s/include", project_root) != 0 ||
+                forge_argv_append(argv, "-c") != 0 ||
+                forge_argv_append(argv, source_path) != 0 ||
+                forge_argv_append(argv, "-o") != 0 ||
+                forge_argv_append(argv, object_path) != 0) {
+                forge_util_set_error(error, error_size, "out of memory while building compile command");
+                forge_argv_free(argv);
                 return -1;
             }
         } else {
@@ -403,89 +377,162 @@ int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
                 forge_util_set_error(error, error_size, "dependency file path is too long");
                 return -1;
             }
-            if (command_append(command, command_size, &length,
-                               "%s -I\"%s/include\" -MMD -MF\"%s\" -c \"%s\" -o \"%s\"",
-                               program, project_root, depfile_path, source_path,
-                               object_path) != 0) {
-                forge_util_set_error(error, error_size, "compile command is too long");
+            if (forge_argv_append(argv, program) != 0 ||
+                forge_argv_appendf(argv, "-I%s/include", project_root) != 0 ||
+                forge_argv_append(argv, "-MMD") != 0 ||
+                forge_argv_append(argv, "-MF") != 0 ||
+                forge_argv_append(argv, depfile_path) != 0 ||
+                forge_argv_append(argv, "-c") != 0 ||
+                forge_argv_append(argv, source_path) != 0 ||
+                forge_argv_append(argv, "-o") != 0 ||
+                forge_argv_append(argv, object_path) != 0) {
+                forge_util_set_error(error, error_size, "out of memory while building compile command");
+                forge_argv_free(argv);
                 return -1;
             }
         }
     }
 
-    for (index = 0U; index < flag_count; ++index) {
-        if (flags == NULL || flags[index] == NULL || flags[index][0] == '\0' ||
-            forge_util_has_shell_unsafe_chars(flags[index]) ||
-            command_append(command, command_size, &length, " %s", flags[index]) != 0) {
-            forge_util_set_error(error, error_size, "invalid or unsafe compiler flags");
-            return -1;
-        }
+    if (forge_flags_append(argv, compiler, profile, 0, error, error_size) != 0) {
+        forge_argv_free(argv);
+        return -1;
     }
     return 0;
 }
 
-int forge_compiler_make_link_command(const ForgeCompiler *compiler,
-                                     int has_cpp_source,
-                                     const char *const *object_paths,
-                                     size_t object_count,
-                                     const char *output_path,
-                                     const char *const *flags, size_t flag_count,
-                                     char *command, size_t command_size,
-                                     char *error, size_t error_size)
+#define FORGE_LINK_RESPONSE_LIMIT 28000U
+
+/* Writes the non-program tail of a link argv into a compiler response file,
+ * using forward slashes so both GCC/Clang and MSVC parse the paths. */
+static int write_response_file(const char *path, const ForgeArgv *argv,
+                               char *error, size_t error_size)
+{
+    FILE *stream;
+    size_t index;
+
+    stream = fopen(path, "w");
+    if (stream == NULL) {
+        forge_util_set_error(error, error_size, "could not write response file '%s'", path);
+        return -1;
+    }
+    for (index = 1U; index < argv->count; ++index) {
+        const char *cursor;
+        if (argv->items[index] == NULL) {
+            break;
+        }
+        (void)fputc('"', stream);
+        for (cursor = argv->items[index]; *cursor != '\0'; ++cursor) {
+            if (*cursor == '"') {
+                (void)fputc('\\', stream);
+                (void)fputc('"', stream);
+            } else if (*cursor == '\\') {
+                (void)fputc('/', stream);
+            } else {
+                (void)fputc(*cursor, stream);
+            }
+        }
+        (void)fputs("\"\n", stream);
+    }
+    if (fclose(stream) != 0) {
+        forge_util_set_error(error, error_size, "could not finish response file '%s'", path);
+        return -1;
+    }
+    return 0;
+}
+
+int forge_compiler_make_link_argv(const ForgeCompiler *compiler,
+                                  int has_cpp_source,
+                                  const char *const *object_paths,
+                                  size_t object_count,
+                                  const char *output_path,
+                                  const char *response_dir,
+                                  const ForgeBuildProfile *profile,
+                                  ForgeArgv *argv,
+                                  int *used_response_file,
+                                  char *error, size_t error_size)
 {
     const char *program;
     size_t index;
-    size_t length = 0U;
+    ForgeArgv response = {0};
+    char response_path[FORGE_PATH_MAX_LOCAL];
 
     if (compiler == NULL || object_paths == NULL || object_count == 0U ||
-        output_path == NULL || output_path[0] == '\0' ||
-        command == NULL || command_size == 0U) {
-        forge_util_set_error(error, error_size, "compiler, object files, output, and command output are required");
+        output_path == NULL || output_path[0] == '\0' || response_dir == NULL ||
+        profile == NULL || argv == NULL || used_response_file == NULL) {
+        forge_util_set_error(error, error_size, "compiler, object files, output, profile, and argv output are required");
         return -1;
     }
-    command[0] = '\0';
-    if (forge_util_has_shell_unsafe_chars(compiler->program) ||
-        forge_util_has_shell_unsafe_chars(output_path)) {
-        forge_util_set_error(error, error_size,
-                             "compiler or output path contains characters unsafe for shell invocation");
+    if (argv->count != 0U) {
+        forge_util_set_error(error, error_size, "link argv output must be empty");
         return -1;
     }
+    *used_response_file = 0;
+
     program = has_cpp_source ? cpp_driver(compiler) : compiler->program;
     if (compiler->kind == FORGE_COMPILER_MSVC) {
         program = compiler->program;
-        if (command_append(command, command_size, &length, "%s /nologo", program) != 0) {
-            forge_util_set_error(error, error_size, "link command is too long");
+        if (forge_argv_append(argv, program) != 0 ||
+            forge_argv_append(argv, "/nologo") != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building link command");
             return -1;
         }
-    } else if (command_append(command, command_size, &length, "%s", program) != 0) {
-        forge_util_set_error(error, error_size, "link command is too long");
+    } else if (forge_argv_append(argv, program) != 0) {
+        forge_util_set_error(error, error_size, "out of memory while building link command");
         return -1;
     }
 
     for (index = 0U; index < object_count; ++index) {
         if (object_paths[index] == NULL || object_paths[index][0] == '\0' ||
-            forge_util_has_shell_unsafe_chars(object_paths[index]) ||
-            command_append(command, command_size, &length, " \"%s\"", object_paths[index]) != 0) {
-            forge_util_set_error(error, error_size, "invalid or unsafe object file list");
+            forge_argv_append(argv, object_paths[index]) != 0) {
+            forge_util_set_error(error, error_size, "invalid object file list");
+            forge_argv_free(argv);
             return -1;
         }
     }
+
     if (compiler->kind == FORGE_COMPILER_MSVC) {
-        if (command_append(command, command_size, &length, " /Fe\"%s\"", output_path) != 0) {
-            forge_util_set_error(error, error_size, "link command is too long");
+        if (forge_argv_appendf(argv, "/Fe%s", output_path) != 0 ||
+            forge_argv_append(argv, "/link") != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building link command");
+            forge_argv_free(argv);
             return -1;
         }
-    } else if (command_append(command, command_size, &length, " -o \"%s\"", output_path) != 0) {
-        forge_util_set_error(error, error_size, "link command is too long");
+    } else if (forge_argv_append(argv, "-o") != 0 ||
+               forge_argv_append(argv, output_path) != 0) {
+        forge_util_set_error(error, error_size, "out of memory while building link command");
+        forge_argv_free(argv);
         return -1;
     }
-    for (index = 0U; index < flag_count; ++index) {
-        if (flags == NULL || flags[index] == NULL || flags[index][0] == '\0' ||
-            forge_util_has_shell_unsafe_chars(flags[index]) ||
-            command_append(command, command_size, &length, " %s", flags[index]) != 0) {
-            forge_util_set_error(error, error_size, "invalid or unsafe linker flags");
-            return -1;
-        }
+
+    if (forge_flags_append(argv, compiler, profile, 1, error, error_size) != 0) {
+        forge_argv_free(argv);
+        return -1;
     }
+
+    if (forge_argv_flatten_bytes(argv) <= FORGE_LINK_RESPONSE_LIMIT) {
+        return 0;
+    }
+    if (snprintf(response_path, sizeof(response_path), "%s/link.rsp",
+                 response_dir) < 0 ||
+        strlen(response_dir) + 10U >= sizeof(response_path)) {
+        forge_util_set_error(error, error_size, "response file path is too long");
+        forge_argv_free(argv);
+        return -1;
+    }
+    if (write_response_file(response_path, argv, error, error_size) != 0) {
+        forge_argv_free(argv);
+        return -1;
+    }
+    response = (ForgeArgv){0};
+    if (forge_argv_append(&response, argv->items[0]) != 0 ||
+        forge_argv_appendf(&response, "@%s", response_path) != 0) {
+        forge_util_set_error(error, error_size, "out of memory while building response command");
+        forge_argv_free(&response);
+        forge_argv_free(argv);
+        return -1;
+    }
+    forge_argv_free(argv);
+    *argv = response;
+    *used_response_file = 1;
     return 0;
 }

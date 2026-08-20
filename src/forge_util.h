@@ -9,15 +9,13 @@ void forge_util_set_error(char *error, size_t error_size, const char *format, ..
 /* Strips leading and trailing whitespace from *text in place, returning text. */
 char *forge_util_trim(char *text);
 
-/* Returns 1 if `program` is invocable from PATH, 0 otherwise. */
-int forge_util_program_available(const char *program);
+/* Returns 1 if `text` ends with `suffix`. */
+int forge_util_has_suffix(const char *text, const char *suffix);
 
 /*
- * Returns 1 if `text` contains characters that are dangerous even inside a
- * double-quoted string on both Windows cmd and POSIX sh. Forge shells out via
- * system(), so manifest/env/filesystem-provided strings with these characters
- * must be rejected instead of being trusted.
+ * Returns 1 if `program` is invocable from PATH, 0 otherwise. Uses a real PATH
+ * sweep rather than a shell so no command interpreter is ever consulted.
  */
-int forge_util_has_shell_unsafe_chars(const char *text);
+int forge_util_program_available(const char *program);
 
 #endif

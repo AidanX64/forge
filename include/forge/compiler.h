@@ -3,6 +3,9 @@
 
 #include <stddef.h>
 
+#include "forge/argv.h"
+#include "forge/manifest.h"
+
 #define FORGE_COMPILER_VALUE_MAX 256U
 #define FORGE_COMMAND_MAX 8192U
 
@@ -58,27 +61,35 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
 int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
                                 size_t depfile_size);
 
-/* Builds a shell command for compiling one source file to one object file. */
-int forge_compiler_make_compile_command(const ForgeCompiler *compiler,
-                                        ForgeSourceLanguage language,
-                                        const char *source_path,
-                                        const char *object_path,
-                                        const char *project_root,
-                                        const char *target_os,
-                                        const char *target_arch,
-                                        const char *const *flags, size_t flag_count,
-                                        char *command, size_t command_size,
-                                        char *error, size_t error_size);
-
-/* Builds a shell command for linking object files into an executable. */
-int forge_compiler_make_link_command(const ForgeCompiler *compiler,
-                                     int has_cpp_source,
-                                     const char *const *object_paths,
-                                     size_t object_count,
-                                     const char *output_path,
-                                     const char *const *flags, size_t flag_count,
-                                     char *command, size_t command_size,
+/* Builds the argv for compiling one source file to one object file. */
+int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
+                                     ForgeSourceLanguage language,
+                                     const char *source_path,
+                                     const char *object_path,
+                                     const char *project_root,
+                                     const char *target_os,
+                                     const char *target_arch,
+                                     const ForgeBuildProfile *profile,
+                                     ForgeArgv *argv,
                                      char *error, size_t error_size);
+
+/*
+ * Builds the argv for linking object files into an executable. When the
+ * flattened command line would exceed what the OS accepts, the object list and
+ * flags are spilled into a compiler response file in `response_dir` and the
+ * compiler is invoked with @<file>; *used_response_file reports whether that
+ * happened so callers can log and clean up.
+ */
+int forge_compiler_make_link_argv(const ForgeCompiler *compiler,
+                                  int has_cpp_source,
+                                  const char *const *object_paths,
+                                  size_t object_count,
+                                  const char *output_path,
+                                  const char *response_dir,
+                                  const ForgeBuildProfile *profile,
+                                  ForgeArgv *argv,
+                                  int *used_response_file,
+                                  char *error, size_t error_size);
 
 const char *forge_host_os_name(ForgeHostOs os);
 const char *forge_compiler_kind_name(ForgeCompilerKind kind);

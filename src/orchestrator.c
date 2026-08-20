@@ -26,28 +26,28 @@
 #include <unistd.h>
 #endif
 
+#include "forge/argv.h"
 #include "forge/compiler.h"
 #include "forge/debug.h"
 #include "forge/build.h"
+#include "forge/fingerprint.h"
 #include "forge/log.h"
 #include "forge/manifest.h"
 #include "forge/orchestrator.h"
-
-#define FORGE_PATH_MAX 1024U
-#define FORGE_MAX_SOURCE_FILES 1024U
-
-typedef struct ForgeSourceFile {
-    char path[FORGE_PATH_MAX];
-    ForgeSourceLanguage language;
-} ForgeSourceFile;
-
-typedef struct ForgeSourceList {
-    ForgeSourceFile *items;
-    size_t count;
-    size_t capacity;
-} ForgeSourceList;
+#include "forge/paths.h"
+#include "forge/process.h"
+#include "forge/sources.h"
+#include "forge/thread.h"
+#include "forge_util.h"
 
 static ForgeLogger *active_logger;
+
+static const char *log_capture_path(void)
+{
+    return (active_logger != NULL && active_logger->path[0] != '\0')
+               ? active_logger->path
+               : NULL;
+}
 
 static void print_error(const char *format, ...)
 {
@@ -64,35 +64,6 @@ static void print_error(const char *format, ...)
         fputc('\n', stderr);
     }
     va_end(arguments);
-}
-
-static int run_external_command(const char *stage, const char *command, int capture_output)
-{
-    char captured_command[FORGE_COMMAND_MAX + FORGE_LOG_PATH_MAX + 32U];
-    char error[FORGE_COMMAND_MAX];
-    int written;
-    int status;
-
-    forge_logger_log(active_logger, stage, "command: %s", command);
-    if (active_logger == NULL || active_logger->file == NULL || !capture_output) {
-        return system(command);
-    }
-    written = snprintf(captured_command, sizeof(captured_command),
-                       "%s >> \"%s\" 2>&1", command, active_logger->path);
-    if (written < 0 || (size_t)written >= sizeof(captured_command)) {
-        print_error("command is too long to capture in the build log");
-        return -1;
-    }
-    if (forge_logger_suspend(active_logger, error, sizeof(error)) != 0) {
-        print_error("%s", error);
-        return -1;
-    }
-    status = system(captured_command);
-    if (forge_logger_resume(active_logger, error, sizeof(error)) != 0) {
-        fprintf(stderr, "forge: %s\n", error);
-        return -1;
-    }
-    return status;
 }
 
 /*
@@ -171,438 +142,17 @@ static void print_log_tail(size_t max_lines)
     free(contents);
 }
 
-static int path_join(char *destination, size_t destination_size,
-                     const char *left, const char *right)
+int forge_build_project_root(const char *manifest_path, char *root, size_t root_size)
 {
-    int written = snprintf(destination, destination_size, "%s/%s", left, right);
-    return written < 0 || (size_t)written >= destination_size ? -1 : 0;
+    char error[FORGE_COMMAND_MAX] = {0};
+    int status = forge_paths_project_root(manifest_path, root, root_size,
+                                          error, sizeof(error));
+
+    if (status != 0 && error[0] != '\0') {
+        print_error("%s", error);
+    }
+    return status;
 }
-
-static int is_absolute_path(const char *path)
-{
-#if FORGE_PLATFORM_WINDOWS
-    return (isalpha((unsigned char)path[0]) && path[1] == ':') ||
-           path[0] == '/' || path[0] == '\\';
-#else
-    return path[0] == '/';
-#endif
-}
-
-/*
- * Resolves a manifest-relative path against the project root. Paths that are
- * already absolute are passed through untouched; relative paths are anchored to
- * the directory that contains the manifest so a build is correct no matter
- * which directory Forge is invoked from.
- */
-static int resolve_project_path(const char *root, const char *relative,
-                                char *destination, size_t destination_size)
-{
-    if (is_absolute_path(relative)) {
-        return snprintf(destination, destination_size, "%s", relative) < 0 ||
-                       (size_t)snprintf(destination, destination_size, "%s", relative)
-                           >= destination_size
-                   ? -1
-                   : 0;
-    }
-    return path_join(destination, destination_size, root, relative);
-}
-
-/*
- * Computes the absolute project root (the directory holding the manifest), so
- * source directories, build output, and logs stay anchored to the project.
- * Returns 0 on success with the root stored in `root`.
- */
-int forge_build_project_root(const char *manifest_path, char *root,
-                             size_t root_size)
-{
-    char full[FORGE_PATH_MAX];
-    char *separator;
-
-#if FORGE_PLATFORM_WINDOWS
-    {
-        DWORD length = GetFullPathNameA(manifest_path, sizeof(full), full, NULL);
-        if (length == 0U || length >= sizeof(full)) {
-            print_error("could not resolve manifest path '%s'", manifest_path);
-            return -1;
-        }
-    }
-#else
-    if (realpath(manifest_path, full) == NULL) {
-        if (snprintf(full, sizeof(full), "%s", manifest_path) < 0 ||
-            strlen(manifest_path) >= sizeof(full)) {
-            print_error("could not resolve manifest path '%s'", manifest_path);
-            return -1;
-        }
-    }
-#endif
-    if (strlen(full) >= root_size) {
-        print_error("manifest path is too long");
-        return -1;
-    }
-    separator = strrchr(full, '/');
-#if FORGE_PLATFORM_WINDOWS
-    {
-        char *backslash = strrchr(full, '\\');
-        if (backslash != NULL && backslash > separator) {
-            separator = backslash;
-        }
-    }
-#endif
-    if (separator == NULL) {
-        (void)snprintf(root, root_size, ".");
-        return 0;
-    }
-    *separator = '\0';
-    (void)snprintf(root, root_size, "%s", full);
-    return 0;
-}
-
-static int has_suffix(const char *path, const char *suffix)
-{
-    size_t path_length = strlen(path);
-    size_t suffix_length = strlen(suffix);
-
-    return path_length >= suffix_length &&
-           strcmp(path + path_length - suffix_length, suffix) == 0;
-}
-
-static int source_matches_language(const char *path, ForgeSourceLanguage language)
-{
-    switch (language) {
-    case FORGE_SOURCE_C:
-        return has_suffix(path, ".c");
-    case FORGE_SOURCE_CPP:
-        return has_suffix(path, ".cc") || has_suffix(path, ".cpp") ||
-               has_suffix(path, ".cxx");
-    case FORGE_SOURCE_ASM:
-        return has_suffix(path, ".s") || has_suffix(path, ".S") ||
-               has_suffix(path, ".asm");
-    }
-    return 0;
-}
-
-static int source_list_add(ForgeSourceList *sources, const char *path,
-                           ForgeSourceLanguage language)
-{
-    ForgeSourceFile *expanded;
-    size_t new_capacity;
-
-    if (sources->count == FORGE_MAX_SOURCE_FILES) {
-        print_error("more than %u source files are not supported in one invocation",
-                    FORGE_MAX_SOURCE_FILES);
-        return -1;
-    }
-    if (sources->count == sources->capacity) {
-        new_capacity = sources->capacity == 0U ? 32U : sources->capacity * 2U;
-        if (new_capacity > FORGE_MAX_SOURCE_FILES) {
-            new_capacity = FORGE_MAX_SOURCE_FILES;
-        }
-        expanded = realloc(sources->items, new_capacity * sizeof(*sources->items));
-        if (expanded == NULL) {
-            print_error("out of memory while collecting source files");
-            return -1;
-        }
-        sources->items = expanded;
-        sources->capacity = new_capacity;
-    }
-    if (snprintf(sources->items[sources->count].path,
-                 sizeof(sources->items[sources->count].path), "%s", path) < 0 ||
-        strlen(path) >= sizeof(sources->items[sources->count].path)) {
-        print_error("source path is too long: %s", path);
-        return -1;
-    }
-    sources->items[sources->count].language = language;
-    ++sources->count;
-    return 0;
-}
-
-static void source_list_free(ForgeSourceList *sources)
-{
-    free(sources->items);
-    *sources = (ForgeSourceList){0};
-}
-
-#if FORGE_PLATFORM_WINDOWS
-static int collect_sources_recursive(const char *directory, ForgeSourceLanguage language,
-                                     ForgeSourceList *sources)
-{
-    WIN32_FIND_DATAA entry;
-    HANDLE handle;
-    char pattern[FORGE_PATH_MAX];
-
-    if (path_join(pattern, sizeof(pattern), directory, "*") != 0) {
-        print_error("source directory path is too long: %s", directory);
-        return -1;
-    }
-    handle = FindFirstFileA(pattern, &entry);
-    if (handle == INVALID_HANDLE_VALUE) {
-        print_error("could not read source directory '%s' (error %lu)", directory,
-                    (unsigned long)GetLastError());
-        return -1;
-    }
-    do {
-        char path[FORGE_PATH_MAX];
-        if (strcmp(entry.cFileName, ".") == 0 || strcmp(entry.cFileName, "..") == 0) {
-            continue;
-        }
-        if (path_join(path, sizeof(path), directory, entry.cFileName) != 0) {
-            print_error("source path is too long under '%s'", directory);
-            (void)FindClose(handle);
-            return -1;
-        }
-        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
-            if (collect_sources_recursive(path, language, sources) != 0) {
-                (void)FindClose(handle);
-                return -1;
-            }
-        } else if (source_matches_language(path, language) &&
-                   source_list_add(sources, path, language) != 0) {
-            (void)FindClose(handle);
-            return -1;
-        }
-    } while (FindNextFileA(handle, &entry) != 0);
-
-    if (GetLastError() != ERROR_NO_MORE_FILES) {
-        print_error("could not finish reading source directory '%s' (error %lu)",
-                    directory, (unsigned long)GetLastError());
-        (void)FindClose(handle);
-        return -1;
-    }
-    (void)FindClose(handle);
-    return 0;
-}
-#else
-static int collect_sources_recursive(const char *directory, ForgeSourceLanguage language,
-                                     ForgeSourceList *sources)
-{
-    DIR *stream;
-    struct dirent *entry;
-
-    stream = opendir(directory);
-    if (stream == NULL) {
-        print_error("could not read source directory '%s': %s", directory, strerror(errno));
-        return -1;
-    }
-    while ((entry = readdir(stream)) != NULL) {
-        char path[FORGE_PATH_MAX];
-        struct stat details;
-
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        if (path_join(path, sizeof(path), directory, entry->d_name) != 0) {
-            print_error("source path is too long under '%s'", directory);
-            (void)closedir(stream);
-            return -1;
-        }
-        if (stat(path, &details) != 0) {
-            print_error("could not inspect source path '%s': %s", path, strerror(errno));
-            (void)closedir(stream);
-            return -1;
-        }
-        if (S_ISDIR(details.st_mode)) {
-            if (collect_sources_recursive(path, language, sources) != 0) {
-                (void)closedir(stream);
-                return -1;
-            }
-        } else if (S_ISREG(details.st_mode) && source_matches_language(path, language) &&
-                   source_list_add(sources, path, language) != 0) {
-            (void)closedir(stream);
-            return -1;
-        }
-    }
-    (void)closedir(stream);
-    return 0;
-}
-#endif
-
-static int collect_sources(const char *project_root, const ForgeManifest *manifest,
-                           ForgeSourceList *sources)
-{
-    const ForgeStringList *lists[] = {
-        &manifest->c_source_dirs,
-        &manifest->cpp_source_dirs,
-        &manifest->asm_source_dirs
-    };
-    const ForgeSourceLanguage languages[] = {
-        FORGE_SOURCE_C,
-        FORGE_SOURCE_CPP,
-        FORGE_SOURCE_ASM
-    };
-    size_t list_index;
-
-    *sources = (ForgeSourceList){0};
-    for (list_index = 0U; list_index < sizeof(lists) / sizeof(lists[0]); ++list_index) {
-        size_t directory_index;
-        for (directory_index = 0U; directory_index < lists[list_index]->count;
-             ++directory_index) {
-            char resolved[FORGE_PATH_MAX];
-            if (resolve_project_path(project_root, lists[list_index]->items[directory_index],
-                                     resolved, sizeof(resolved)) != 0) {
-                print_error("source directory path is too long: %s",
-                            lists[list_index]->items[directory_index]);
-                source_list_free(sources);
-                return -1;
-            }
-            if (collect_sources_recursive(resolved, languages[list_index], sources) != 0) {
-                source_list_free(sources);
-                return -1;
-            }
-        }
-    }
-    if (sources->count == 0U) {
-        print_error("the manifest source directories contain no C, C++, or assembly files");
-        return -1;
-    }
-    return 0;
-}
-
-static int ensure_directory(const char *path)
-{
-    char current[FORGE_PATH_MAX];
-    size_t index;
-    size_t length = strlen(path);
-
-    if (length == 0U || length >= sizeof(current)) {
-        print_error("invalid output directory path");
-        return -1;
-    }
-    (void)snprintf(current, sizeof(current), "%s", path);
-    for (index = 1U; index <= length; ++index) {
-        if (current[index] != '/' && current[index] != '\\' && current[index] != '\0') {
-            continue;
-        }
-        {
-            char saved = current[index];
-            current[index] = '\0';
-#if FORGE_PLATFORM_WINDOWS
-            if (CreateDirectoryA(current, NULL) == 0 &&
-                GetLastError() != ERROR_ALREADY_EXISTS) {
-                print_error("could not create output directory '%s' (error %lu)", current,
-                            (unsigned long)GetLastError());
-                return -1;
-            }
-#else
-            if (mkdir(current, 0777) != 0 && errno != EEXIST) {
-                print_error("could not create output directory '%s': %s", current,
-                            strerror(errno));
-                return -1;
-            }
-#endif
-            current[index] = saved;
-        }
-    }
-    return 0;
-}
-
-#if FORGE_PLATFORM_WINDOWS
-static int remove_tree(const char *path)
-{
-    WIN32_FIND_DATAA entry;
-    HANDLE handle;
-    char pattern[FORGE_PATH_MAX];
-
-    if (path_join(pattern, sizeof(pattern), path, "*") != 0) {
-        print_error("clean path is too long: %s", path);
-        return -1;
-    }
-    handle = FindFirstFileA(pattern, &entry);
-    if (handle == INVALID_HANDLE_VALUE) {
-        if (GetLastError() == ERROR_FILE_NOT_FOUND ||
-            GetLastError() == ERROR_PATH_NOT_FOUND) {
-            return 0;
-        }
-        print_error("could not open directory to clean '%s' (error %lu)", path,
-                    (unsigned long)GetLastError());
-        return -1;
-    }
-    do {
-        char child[FORGE_PATH_MAX];
-
-        if (strcmp(entry.cFileName, ".") == 0 || strcmp(entry.cFileName, "..") == 0) {
-            continue;
-        }
-        if (path_join(child, sizeof(child), path, entry.cFileName) != 0) {
-            print_error("clean path is too long under '%s'", path);
-            (void)FindClose(handle);
-            return -1;
-        }
-        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
-            if (remove_tree(child) != 0) {
-                (void)FindClose(handle);
-                return -1;
-            }
-        } else if (DeleteFileA(child) == 0) {
-            print_error("could not delete file '%s' (error %lu)", child,
-                        (unsigned long)GetLastError());
-            (void)FindClose(handle);
-            return -1;
-        }
-    } while (FindNextFileA(handle, &entry) != 0);
-
-    if (GetLastError() != ERROR_NO_MORE_FILES) {
-        print_error("could not finish cleaning '%s' (error %lu)", path,
-                    (unsigned long)GetLastError());
-        (void)FindClose(handle);
-        return -1;
-    }
-    (void)FindClose(handle);
-    if (RemoveDirectoryA(path) == 0) {
-        print_error("could not remove directory '%s' (error %lu)", path,
-                    (unsigned long)GetLastError());
-        return -1;
-    }
-    return 0;
-}
-#else
-static int remove_tree(const char *path)
-{
-    DIR *stream = opendir(path);
-    struct dirent *entry;
-
-    if (stream == NULL) {
-        if (errno == ENOENT) {
-            return 0;
-        }
-        print_error("could not open directory to clean '%s': %s", path, strerror(errno));
-        return -1;
-    }
-    while ((entry = readdir(stream)) != NULL) {
-        char child[FORGE_PATH_MAX];
-        struct stat details;
-
-        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
-            continue;
-        }
-        if (path_join(child, sizeof(child), path, entry->d_name) != 0) {
-            print_error("clean path is too long under '%s'", path);
-            (void)closedir(stream);
-            return -1;
-        }
-        if (stat(child, &details) != 0) {
-            print_error("could not inspect '%s': %s", child, strerror(errno));
-            (void)closedir(stream);
-            return -1;
-        }
-        if (S_ISDIR(details.st_mode)) {
-            if (remove_tree(child) != 0) {
-                (void)closedir(stream);
-                return -1;
-            }
-        } else if (unlink(child) != 0) {
-            print_error("could not delete '%s': %s", child, strerror(errno));
-            (void)closedir(stream);
-            return -1;
-        }
-    }
-    (void)closedir(stream);
-    if (rmdir(path) != 0) {
-        print_error("could not remove directory '%s': %s", path, strerror(errno));
-        return -1;
-    }
-    return 0;
-}
-#endif
 
 static const char *host_architecture(void)
 {
@@ -648,225 +198,165 @@ static int select_host_target(const ForgeManifest *manifest, const ForgeHostInfo
     return 0;
 }
 
-static void safe_output_name(const char *project_name, char *output, size_t output_size)
-{
-    size_t index;
+typedef struct ForgeCompileContext {
+    const ForgeCompiler *compiler;
+    const ForgeBuildProfile *profile;
+    const ForgeSourceList *sources;
+    char (*object_paths)[FORGE_PATH_MAX];
+    const char **object_references;
+    const char *project_root;
+    const char *target_os;
+    const char *target_arch;
+    size_t count;
+    size_t next;
+    int has_cpp_source;
+    int failed;
+    char error[FORGE_COMMAND_MAX];
+    ForgeMutex job_mutex;
+    ForgeMutex log_mutex;
+} ForgeCompileContext;
 
-    for (index = 0U; index + 1U < output_size && project_name[index] != '\0'; ++index) {
-        unsigned char character = (unsigned char)project_name[index];
-        output[index] = isalnum(character) || character == '-' || character == '_' ||
-                        character == '.' ? (char)character : '-';
-    }
-    output[index] = '\0';
+static void compile_log(ForgeCompileContext *context, const char *stage,
+                        const char *format, ...)
+{
+    va_list arguments;
+    char message[FORGE_COMMAND_MAX];
+
+    va_start(arguments, format);
+    (void)vsnprintf(message, sizeof(message), format, arguments);
+    va_end(arguments);
+    forge_mutex_lock(&context->log_mutex);
+    forge_logger_log(active_logger, stage, "%s", message);
+    forge_mutex_unlock(&context->log_mutex);
 }
 
-/*
- * Stable FNV-1a hash of a source path. Object files are named after this hash
- * instead of their compile index, so adding/removing/reordering sources never
- * makes an object file "belong" to a different source than the one stored in
- * it (which an index-based scheme would allow once we skip fresh files).
- */
-static unsigned int source_hash(const char *text)
+static void compile_fail(ForgeCompileContext *context, const char *message)
 {
-    unsigned int hash = 2166136261U;
-
-    while (*text != '\0') {
-        hash ^= (unsigned char)*text++;
-        hash *= 16777619U;
+    forge_mutex_lock(&context->job_mutex);
+    if (!context->failed && message != NULL && message[0] != '\0') {
+        (void)snprintf(context->error, sizeof(context->error), "%s", message);
     }
-    return hash;
+    context->failed = 1;
+    forge_mutex_unlock(&context->job_mutex);
 }
 
-/*
- * Returns 1 when `path` is missing or its mtime is strictly newer than the
- * object file, so the object is stale with respect to that dependency. A
- * missing dependency is treated as stale (conservative): the recompile that
- * follows either fails loudly if the file is still needed, or regenerates a
- * correct dependency list if it is not.
- */
-static int dependency_is_stale(const char *path, const char *object_path)
+static void compile_source_job(ForgeCompileContext *context, size_t source_index)
 {
-#if FORGE_PLATFORM_WINDOWS
-    WIN32_FILE_ATTRIBUTE_DATA path_data;
-    WIN32_FILE_ATTRIBUTE_DATA object_data;
+    const char *source_path = context->sources->items[source_index].path;
+    const char *object_path = context->object_paths[source_index];
+    ForgeArgv argv = {0};
+    char display[FORGE_COMMAND_MAX];
+    char error[FORGE_COMMAND_MAX] = {0};
+    int exit_code;
+    int track_headers;
 
-    if (GetFileAttributesExA(path, GetFileExInfoStandard, &path_data) == 0 ||
-        GetFileAttributesExA(object_path, GetFileExInfoStandard, &object_data) == 0) {
-        return 1;
+    track_headers = context->compiler->kind != FORGE_COMPILER_MSVC &&
+                    context->sources->items[source_index].language != FORGE_SOURCE_ASM;
+    if (forge_fingerprint_object_fresh(object_path, source_path, track_headers)) {
+        compile_log(context, "compile", "up-to-date: %s", source_path);
+        context->object_references[source_index] = object_path;
+        if (context->sources->items[source_index].language == FORGE_SOURCE_CPP) {
+            context->has_cpp_source = 1;
+        }
+        return;
     }
-    return CompareFileTime(&path_data.ftLastWriteTime, &object_data.ftLastWriteTime) > 0;
-#else
-    struct stat path_stat;
-    struct stat object_stat;
-
-    if (stat(path, &path_stat) != 0 || stat(object_path, &object_stat) != 0) {
-        return 1;
+    if (forge_compiler_make_compile_argv(context->compiler,
+                                         context->sources->items[source_index].language,
+                                         source_path, object_path, context->project_root,
+                                         context->target_os, context->target_arch,
+                                         context->profile, &argv, error, sizeof(error)) != 0) {
+        compile_fail(context, error);
+        return;
     }
-    return path_stat.st_mtime > object_stat.st_mtime;
-#endif
+    compile_log(context, "compile", "source: %s", source_path);
+    (void)forge_argv_finalize(&argv);
+    if (forge_argv_join(display, sizeof(display), &argv) == 0) {
+        compile_log(context, "compile", "command: %s", display);
+    }
+    if (forge_process_run(argv.items, log_capture_path(), 1,
+                          &exit_code, error, sizeof(error)) != 0) {
+        forge_argv_free(&argv);
+        compile_fail(context, error);
+        return;
+    }
+    forge_argv_free(&argv);
+    if (exit_code != 0) {
+        char message[FORGE_COMMAND_MAX];
+        (void)snprintf(message, sizeof(message), "compiler failed for %s", source_path);
+        compile_fail(context, message);
+        return;
+    }
+    context->object_references[source_index] = object_path;
+    if (context->sources->items[source_index].language == FORGE_SOURCE_CPP) {
+        context->has_cpp_source = 1;
+    }
 }
 
-/*
- * Walks a gcc/clang dependency file (Makefile syntax: "target: dep dep \"
- * "...") and returns 1 if any listed file is stale relative to the object.
- * The paths are what the compiler itself resolved during compilation, so this
- * tracks exactly the headers each translation unit used, including ones found
- * through user-provided -I flags.
- */
-static int depfile_has_stale_dependency(FILE *stream, const char *object_path)
+static void compile_worker(void *argument)
 {
-    char token[FORGE_PATH_MAX];
-    size_t token_length = 0U;
-    int character;
+    ForgeCompileContext *context = (ForgeCompileContext *)argument;
 
-    while ((character = fgetc(stream)) != EOF) {
-        if (character == ':') {
-            /*
-             * The target/rule separator is the colon on the target line, which
-             * is followed by a space or a continuation backslash then a newline
-             * (e.g. `C:\...\obj.o: \` or `obj.o: dep`). A drive-letter colon
-             * (`C:\...`) is followed by more path text, so reading one char
-             * ahead tells the two apart; this matters because GCC/Clang emit
-             * drive letters here on Windows.
-             */
-            int next = fgetc(stream);
-            int separator = 0;
+    for (;;) {
+        size_t index;
 
-            if (next == ' ' || next == '\t' || next == '\r' ||
-                next == '\n' || next == EOF) {
-                separator = 1;
-            } else if (next == '\\') {
-                int after_backslash = fgetc(stream);
-                if (after_backslash == '\r') {
-                    after_backslash = fgetc(stream);
-                }
-                if (after_backslash == '\n') {
-                    separator = 1;
-                } else if (after_backslash != EOF) {
-                    (void)ungetc(after_backslash, stream);
-                    (void)ungetc(next, stream);
-                    if (token_length + 1U < sizeof(token)) {
-                        token[token_length++] = (char)character;
-                    }
-                    continue;
-                }
-            } else {
-                (void)ungetc(next, stream);
-                if (token_length + 1U < sizeof(token)) {
-                    token[token_length++] = (char)character;
-                }
-                continue;
-            }
-            /* Target/rule separator colon: skip it; the dependencies follow. */
-            if (separator) {
-                continue;
-            }
+        forge_mutex_lock(&context->job_mutex);
+        if (context->failed) {
+            forge_mutex_unlock(&context->job_mutex);
+            return;
         }
-        /*
-         * A backslash at a line end is make's continuation marker; treat it as
-         * a separator rather than glue so a depfile without a space before the
-         * backslash never joins two paths into one bogus token.
-         */
-        if (character == '\\') {
-            int next = fgetc(stream);
-            if (next == '\r') {
-                next = fgetc(stream);
-            }
-            if (next == '\n') {
-                if (token_length != 0U) {
-                    token[token_length] = '\0';
-                    if (dependency_is_stale(token, object_path)) {
-                        return 1;
-                    }
-                    token_length = 0U;
-                }
-                continue;
-            }
-            if (next != EOF && token_length + 1U < sizeof(token)) {
-                token[token_length++] = (char)character;
-            }
-            if (next != EOF && ungetc(next, stream) == EOF) {
-                return 0;
-            }
-            continue;
+        if (context->next >= context->count) {
+            forge_mutex_unlock(&context->job_mutex);
+            return;
         }
-        if (character == ' ' || character == '\t' ||
-            character == '\r' || character == '\n') {
-            if (token_length != 0U) {
-                token[token_length] = '\0';
-                if (dependency_is_stale(token, object_path)) {
-                    return 1;
-                }
-                token_length = 0U;
-            }
-            continue;
-        }
-        if (token_length + 1U < sizeof(token)) {
-            token[token_length++] = (char)character;
-        }
+        index = context->next++;
+        forge_mutex_unlock(&context->job_mutex);
+
+        compile_source_job(context, index);
     }
-    if (token_length != 0U) {
-        token[token_length] = '\0';
-        return dependency_is_stale(token, object_path);
-    }
-    return 0;
 }
 
-/*
- * Returns 1 when an existing object file is at least as new as both its source
- * and (when `track_headers` is set) every header the compiler recorded for it
- * via -MMD -MF, so the compile step can be skipped. A missing dependency file
- * is treated as stale so the very next build regenerates it. Toolchains that
- * write no dependency file (MSVC, and assembly sources) only compare the
- * source mtime.
- */
-static int object_is_fresh(const char *object_path, const char *source_path,
-                           int track_headers)
+/* Returns 0 on success, -1 when the compile phase failed. */
+static int run_compile_pool(ForgeCompileContext *context, int max_jobs)
 {
-    char depfile_path[FORGE_PATH_MAX];
-    FILE *stream;
-    int fresh;
+    ForgeThread *workers;
+    int worker_count;
+    int workers_started = 0;
+    int index;
 
-#if FORGE_PLATFORM_WINDOWS
-    WIN32_FILE_ATTRIBUTE_DATA object_data;
-    WIN32_FILE_ATTRIBUTE_DATA source_data;
-
-    if (GetFileAttributesExA(object_path, GetFileExInfoStandard, &object_data) == 0 ||
-        GetFileAttributesExA(source_path, GetFileExInfoStandard, &source_data) == 0) {
+    if (context->count == 0U) {
         return 0;
     }
-    if (CompareFileTime(&object_data.ftLastWriteTime, &source_data.ftLastWriteTime) < 0) {
-        return 0;
+    worker_count = max_jobs <= 0 ? forge_thread_processor_count() : max_jobs;
+    if (worker_count > (int)context->count) {
+        worker_count = (int)context->count;
     }
-#else
-    struct stat object_stat;
-    struct stat source_stat;
-
-    if (stat(object_path, &object_stat) != 0 || stat(source_path, &source_stat) != 0) {
-        return 0;
+    if (worker_count < 1) {
+        worker_count = 1;
     }
-    if (object_stat.st_mtime < source_stat.st_mtime) {
-        return 0;
+    workers = calloc((size_t)worker_count, sizeof(*workers));
+    if (workers == NULL) {
+        print_error("out of memory while preparing build workers");
+        return -1;
     }
-#endif
-    if (!track_headers) {
-        return 1;
+    for (index = 0; index < worker_count; ++index) {
+        if (forge_thread_spawn(&workers[index], compile_worker, context) != 0) {
+            break;
+        }
+        ++workers_started;
     }
-    if (forge_compiler_depfile_path(object_path, depfile_path,
-                                    sizeof(depfile_path)) != 0) {
-        return 0;
+    for (index = 0; index < workers_started; ++index) {
+        (void)forge_thread_join(&workers[index]);
     }
-    stream = fopen(depfile_path, "rb");
-    if (stream == NULL) {
-        return 0;
+    free(workers);
+    if (workers_started < worker_count) {
+        print_error("could not start all build workers");
+        return -1;
     }
-    fresh = !depfile_has_stale_dependency(stream, object_path);
-    (void)fclose(stream);
-    return fresh;
+    return context->failed ? -1 : 0;
 }
 
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
-                        int release, int should_run,
+                        int release, int should_run, int max_jobs,
                         char *built_executable, size_t built_executable_size)
 {
     ForgeHostInfo host;
@@ -875,19 +365,22 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     const ForgeBuildProfile *profile;
     const char *target_os;
     const char *target_arch;
+    ForgeCompileContext context = {0};
+    ForgeArgv argv = {0};
     char error[FORGE_COMMAND_MAX] = {0};
     char target_directory[FORGE_PATH_MAX];
     char profile_directory[FORGE_PATH_MAX];
     char object_directory[FORGE_PATH_MAX];
     char executable_name[FORGE_MANIFEST_VALUE_MAX];
     char executable_path[FORGE_PATH_MAX];
-    char command[FORGE_COMMAND_MAX];
+    char display[FORGE_COMMAND_MAX];
     char (*object_paths)[FORGE_PATH_MAX] = NULL;
+    char (*used_object_names)[FORGE_PATH_MAX] = NULL;
     const char **object_references = NULL;
-    const char *flags[FORGE_MANIFEST_MAX_ITEMS];
     size_t source_index;
-    size_t flag_index;
-    int has_cpp_source = 0;
+    size_t used_count = 0U;
+    int used_response_file = 0;
+    int exit_code;
     int result = -1;
 
     if (forge_detect_host(&host, error, sizeof(error)) != 0) {
@@ -897,7 +390,8 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     if (select_host_target(manifest, &host, &target_os, &target_arch) != 0 ||
         forge_compiler_select(&host, manifest->compiler_override, &compiler,
                               error, sizeof(error)) != 0 ||
-        collect_sources(project_root, manifest, &sources) != 0) {
+        forge_sources_collect(project_root, manifest, &sources, error,
+                        sizeof(error)) != 0) {
         if (error[0] != '\0') {
             print_error("%s", error);
         }
@@ -905,35 +399,38 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     }
 
     profile = release ? &manifest->release_profile : &manifest->debug_profile;
-    for (flag_index = 0U; flag_index < profile->cflags.count; ++flag_index) {
-        flags[flag_index] = profile->cflags.items[flag_index];
-    }
-    if (resolve_project_path(project_root, "target", target_directory,
+    if (forge_paths_resolve(project_root, "target", target_directory,
                              sizeof(target_directory)) != 0 ||
-        path_join(profile_directory, sizeof(profile_directory), target_directory,
-                  release ? "release" : "debug") != 0 ||
-        path_join(object_directory, sizeof(object_directory), profile_directory, "obj") != 0) {
+        forge_paths_join(profile_directory, sizeof(profile_directory), target_directory,
+                         release ? "release" : "debug") != 0 ||
+        forge_paths_join(object_directory, sizeof(object_directory), profile_directory,
+                         "obj") != 0) {
         print_error("output path is too long");
         goto cleanup;
     }
-    if (ensure_directory(object_directory) != 0) {
+    if (forge_paths_ensure_directory(object_directory, error, sizeof(error)) != 0) {
+        if (error[0] != '\0') {
+            print_error("%s", error);
+        }
         goto cleanup;
     }
-    safe_output_name(manifest->project_name, executable_name, sizeof(executable_name));
+    forge_paths_safe_output_name(manifest->project_name, executable_name,
+                                 sizeof(executable_name));
 #if FORGE_PLATFORM_WINDOWS
     if (snprintf(executable_path, sizeof(executable_path), "%s/%s.exe",
                  profile_directory, executable_name) < 0 ||
         strlen(profile_directory) + strlen(executable_name) + 5U >= sizeof(executable_path)) {
 #else
-    if (path_join(executable_path, sizeof(executable_path), profile_directory,
-                  executable_name) != 0) {
+    if (forge_paths_join(executable_path, sizeof(executable_path), profile_directory,
+                         executable_name) != 0) {
 #endif
         print_error("executable output path is too long");
         goto cleanup;
     }
     object_paths = calloc(sources.count, sizeof(*object_paths));
+    used_object_names = calloc(sources.count, sizeof(*used_object_names));
     object_references = calloc(sources.count, sizeof(*object_references));
-    if (object_paths == NULL || object_references == NULL) {
+    if (object_paths == NULL || used_object_names == NULL || object_references == NULL) {
         print_error("out of memory while preparing build outputs");
         goto cleanup;
     }
@@ -946,57 +443,72 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
         forge_logger_log(active_logger, "dispatch",
                          "MSVC writes no dependency files; header edits will not trigger recompiles");
     }
-    forge_logger_log(active_logger, "compile", "----- compile %zu source file(s) -----",
-                     sources.count);
+
     for (source_index = 0U; source_index < sources.count; ++source_index) {
-        const char *source_path = sources.items[source_index].path;
-        int written = snprintf(object_paths[source_index], sizeof(object_paths[source_index]),
-                               "%s/%08x.o", object_directory, source_hash(source_path));
-        if (written < 0 || (size_t)written >= sizeof(object_paths[source_index])) {
-            print_error("object path is too long");
+        if (forge_fingerprint_object_name(object_directory,
+                                      sources.items[source_index].path,
+                                      used_object_names, used_count,
+                                      object_paths[source_index],
+                                      sizeof(object_paths[source_index])) != 0) {
+            print_error("object path is too long or object-name collisions were not resolvable");
             goto cleanup;
         }
-        if (object_is_fresh(object_paths[source_index], source_path,
-                            compiler.kind != FORGE_COMPILER_MSVC &&
-                                sources.items[source_index].language != FORGE_SOURCE_ASM)) {
-            forge_logger_log(active_logger, "compile", "up-to-date: %s", source_path);
-            object_references[source_index] = object_paths[source_index];
-            if (sources.items[source_index].language == FORGE_SOURCE_CPP) {
-                has_cpp_source = 1;
-            }
-            continue;
-        }
-        if (forge_compiler_make_compile_command(&compiler, sources.items[source_index].language,
-                                                source_path,
-                                                object_paths[source_index], project_root,
-                                                target_os,
-                                                target_arch, flags, profile->cflags.count,
-                                                command, sizeof(command), error,
-                                                sizeof(error)) != 0) {
-            print_error("%s", error);
-            goto cleanup;
-        }
-        forge_logger_log(active_logger, "compile", "source: %s", source_path);
-        if (run_external_command("compile", command, 1) != 0) {
-            print_error("compiler failed for %s", source_path);
-            print_log_tail(24U);
-            goto cleanup;
-        }
-        object_references[source_index] = object_paths[source_index];
-        if (sources.items[source_index].language == FORGE_SOURCE_CPP) {
-            has_cpp_source = 1;
-        }
+        (void)snprintf(used_object_names[used_count], sizeof(used_object_names[used_count]),
+                       "%s", object_paths[source_index]);
+        ++used_count;
     }
 
-    if (forge_compiler_make_link_command(&compiler, has_cpp_source, object_references,
-                                         sources.count, executable_path, flags,
-                                         profile->cflags.count, command, sizeof(command),
-                                         error, sizeof(error)) != 0) {
+    forge_logger_log(active_logger, "compile", "----- compile %zu source file(s) with %d job(s) -----",
+                     sources.count, max_jobs <= 0 ? forge_thread_processor_count() : max_jobs);
+    context.compiler = &compiler;
+    context.profile = profile;
+    context.sources = &sources;
+    context.object_paths = object_paths;
+    context.object_references = object_references;
+    context.project_root = project_root;
+    context.target_os = target_os;
+    context.target_arch = target_arch;
+    context.count = sources.count;
+    context.next = 0U;
+    forge_mutex_init(&context.job_mutex);
+    forge_mutex_init(&context.log_mutex);
+    if (run_compile_pool(&context, max_jobs) != 0) {
+        forge_mutex_destroy(&context.job_mutex);
+        forge_mutex_destroy(&context.log_mutex);
+        print_error("%s", context.error[0] != '\0' ? context.error : "compile phase failed");
+        print_log_tail(24U);
+        goto cleanup;
+    }
+    forge_mutex_destroy(&context.job_mutex);
+    forge_mutex_destroy(&context.log_mutex);
+
+    argv = (ForgeArgv){0};
+    if (forge_compiler_make_link_argv(&compiler, context.has_cpp_source, object_references,
+                                      sources.count, executable_path, profile_directory,
+                                      profile, &argv, &used_response_file, error,
+                                      sizeof(error)) != 0) {
         print_error("%s", error);
         goto cleanup;
     }
     forge_logger_log(active_logger, "link", "----- link %s -----", executable_path);
-    if (run_external_command("link", command, 1) != 0) {
+    (void)forge_argv_finalize(&argv);
+    if (forge_argv_join(display, sizeof(display), &argv) == 0) {
+        forge_logger_log(active_logger, "link", "command: %s", display);
+    }
+    if (used_response_file) {
+        forge_logger_log(active_logger, "link",
+                         "long link line: objects and flags spilled to %s/link.rsp",
+                         profile_directory);
+    }
+    exit_code = 0;
+    if (forge_process_run(argv.items, log_capture_path(), 1,
+                          &exit_code, error, sizeof(error)) != 0) {
+        print_error("%s", error);
+        forge_argv_free(&argv);
+        goto cleanup;
+    }
+    forge_argv_free(&argv);
+    if (exit_code != 0) {
         print_error("linker failed");
         print_log_tail(24U);
         goto cleanup;
@@ -1013,17 +525,23 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
         goto cleanup;
     }
     forge_logger_log(active_logger, "run", "----- run %s -----", executable_path);
-#if FORGE_PLATFORM_WINDOWS
-    if (snprintf(command, sizeof(command), "cmd /C \"\"%s\"\"", executable_path) < 0 ||
-        strlen(executable_path) + 13U >= sizeof(command)) {
-#else
-    if (snprintf(command, sizeof(command), "\"%s\"", executable_path) < 0 ||
-        strlen(executable_path) + 3U >= sizeof(command)) {
-#endif
-        print_error("run command is too long");
+    argv = (ForgeArgv){0};
+    if (forge_argv_append(&argv, executable_path) != 0) {
+        print_error("out of memory while preparing run command");
         goto cleanup;
     }
-    if (run_external_command("run", command, 0) != 0) {
+    (void)forge_argv_finalize(&argv);
+    if (forge_argv_join(display, sizeof(display), &argv) == 0) {
+        forge_logger_log(active_logger, "run", "program: %s", display);
+    }
+    exit_code = 0;
+    if (forge_process_run(argv.items, NULL, 0, &exit_code, error, sizeof(error)) != 0) {
+        forge_argv_free(&argv);
+        print_error("%s", error);
+        goto cleanup;
+    }
+    forge_argv_free(&argv);
+    if (exit_code != 0) {
         print_error("program failed");
         print_log_tail(24U);
         goto cleanup;
@@ -1031,9 +549,11 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     result = 0;
 
 cleanup:
+    forge_argv_free(&argv);
     free(object_references);
+    free(used_object_names);
     free(object_paths);
-    source_list_free(&sources);
+    forge_sources_free(&sources);
     return result;
 }
 
@@ -1051,12 +571,13 @@ int forge_build_clean(const char *manifest_path)
     if (forge_build_project_root(manifest_path, project_root, sizeof(project_root)) != 0) {
         return 1;
     }
-    if (resolve_project_path(project_root, "target", target_path, sizeof(target_path)) != 0) {
+    if (forge_paths_resolve(project_root, "target", target_path,
+                            sizeof(target_path)) != 0) {
         print_error("clean path is too long");
         return 1;
     }
     printf("forge: removing %s\n", target_path);
-    if (remove_tree(target_path) != 0) {
+    if (forge_paths_remove_tree(target_path, NULL, 0U) != 0) {
         return 1;
     }
     printf("forge: clean\n");

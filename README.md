@@ -34,9 +34,14 @@ of raw C.)
 - `src/cli.c` parses command-line arguments.
 - `src/commands.c` owns `run`, `debug`, and `clean` invocation lifecycles.
 - `src/orchestrator.c` is the build engine: source discovery, compiler dispatch,
-  output layout, and build execution.
-- `src/manifest.c`, `src/compiler.c`, `src/log.c`, and `src/debug.c` provide the
-  focused subsystems used by the build engine.
+  output layout, and build execution (compiles run on a thread pool).
+- `src/manifest.c`, `src/compiler.c`, `src/flags.c`, `src/log.c`, and
+  `src/debug.c` provide the focused subsystems used by the build engine.
+- `src/flags.c` translates portable profile fields into each compiler's flag
+  dialect (`-g`/`-O*` for GCC/Clang, `/Zi`/`/Od` for MSVC).
+- `src/argv.c`, `src/process.c`, and `src/thread.c` provide the dynamic
+  argument lists, shell-free process spawning, and thread pool primitives
+  under the build engine.
 - `src/forge_util.h` / `src/forge_util.c` hold small shared helpers (error
   formatting, trimming, PATH lookups) used across modules.
 - `include/forge/` contains the interfaces between those modules.
@@ -119,6 +124,7 @@ forge --help
 cd <your-project>       # any dir with a Forge.toml + src/
 forge run               # build (debug) and run
 forge run --release     # build (release) and run
+forge run -j 8          # compile up to 8 translation units in parallel
 forge debug             # build, then launch a debugger
 forge clean             # remove the project's target/ output
 forge run --manifest path/to/Forge.toml
@@ -138,12 +144,23 @@ forge run --release     # prints "Hello world!"
 Simple, Cargo-style commands (`forge run`, `forge run --release`, ...)
 replace verbose, hand-rolled Makefiles/build scripts.
 
+Compilation is parallel: sources are compiled by a job pool sized to the host's
+logical processors by default (`-j N` overrides; `-j auto` restores the
+default). Compiles are independent, so a flat pool then a single link step
+covers the dependency graph.
+
 Incremental: already-compiled source files are skipped on rebuild. With GCC
 and Clang, Forge asks the compiler to record the headers each translation
 unit pulled in (`-MMD -MF`) and compares object mtimes against both the
 source and every listed header, so touching a `.h` recompiles exactly the
 files that use it. Toolchains that emit no dependency file (MSVC, assembly
 sources) compare source mtimes only.
+
+Processes are spawned directly with an argv array (`CreateProcess` /
+`execvp`) — no shell is ever consulted, so paths and flags containing spaces
+or metacharacters are passed literally. Commands that would exceed the OS
+command-line limit spill the object list and flags into a compiler response
+file (`@target/<profile>/link.rsp`) automatically.
 
 ### Cross-platform compiler dispatch
 Forge detects the host OS and version at build time and automatically
@@ -173,16 +190,30 @@ arch = ["x86_64", "aarch64"]         # required
 compiler = "clang-17"        # optional: override compiler dispatch entirely
 
 [profile.debug]
-cflags = ["-g", "-O0"]       # required
+opt-level = 0                # 0..3, or omit for the compiler default
+debug = true                 # debug info: -g / /Zi + /DEBUG
+warnings-as-errors = true    # -Werror / /WX
+std = "c11"                  # "c11", "c17", "c++20", ...; MSVC maps supported ones
+cflags = ["-Wall"]           # optional raw extra flags (GCC/Clang dialect)
 
 [profile.release]
-cflags = ["-O2"]             # required
+opt-level = 2
+std = "c17"
 ```
 
 `targets.os`/`arch` list the hosts this project may build for; Forge builds
 the current host only (no cross-compilation). Assembly: GCC/Clang toolchains
 accept `.s`/`.S` sources; the MSVC-specific `.asm` dialect requires the MSVC
 toolchain (`ml64`).
+
+The `opt-level`, `debug`, `warnings-as-errors`, and `std` profile fields are
+portable: each compiler backend translates them to its own dialect, so the
+same manifest builds under GCC, Clang, and MSVC. Raw `cflags` are GCC/Clang
+syntax; when MSVC is selected, common flags (`-g`, `-O*`, `-Wall`, `-Werror`,
+`-std=`, `-D`/`-I`) are translated, and any flag with no MSVC equivalent is
+rejected with a diagnostic pointing at the portable fields instead of being
+silently passed through. A profile with no flags at all uses the compiler
+defaults.
 
 ### Clearer debugging
 The `debug` subcommand shells out to the target OS's native debugger

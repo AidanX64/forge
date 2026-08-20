@@ -3,7 +3,7 @@
 
 #include <stddef.h>
 
-#define FORGE_MANIFEST_MAX_ITEMS 32U
+#define FORGE_MANIFEST_MAX_ITEMS 128U
 #define FORGE_MANIFEST_VALUE_MAX 256U
 
 typedef struct ForgeStringList {
@@ -12,7 +12,11 @@ typedef struct ForgeStringList {
 } ForgeStringList;
 
 typedef struct ForgeBuildProfile {
-    ForgeStringList cflags;
+    int opt_level; /* -1 = compiler default; 0..3 = -O0..-O3 / /Od.. /O2 */
+    int debug_info; /* 0 = none; >0 = debug info for -g / /Zi + /DEBUG */
+    int warnings_as_errors; /* 0/1 */
+    char std_version[FORGE_MANIFEST_VALUE_MAX]; /* "c11", "c++20", ...; "" = default */
+    ForgeStringList cflags; /* raw extra flags, GCC/Clang dialect (translated for MSVC) */
 } ForgeBuildProfile;
 
 typedef struct ForgeManifest {

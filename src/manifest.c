@@ -3,6 +3,7 @@
 #endif
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "forge/manifest.h"
@@ -20,6 +21,14 @@ typedef enum ForgeManifestSection {
     FORGE_SECTION_PROFILE_RELEASE
 } ForgeManifestSection;
 
+typedef struct ForgeProfileSeen {
+    int opt_level;
+    int debug_info;
+    int warnings_as_errors;
+    int std_version;
+    int cflags;
+} ForgeProfileSeen;
+
 typedef struct ForgeManifestSeen {
     int project_name;
     int source_c;
@@ -28,8 +37,8 @@ typedef struct ForgeManifestSeen {
     int target_os;
     int target_arch;
     int compiler;
-    int debug_cflags;
-    int release_cflags;
+    ForgeProfileSeen debug;
+    ForgeProfileSeen release;
 } ForgeManifestSeen;
 
 static void remove_comment(char *text)
@@ -206,6 +215,75 @@ static int reject_duplicate(int *seen, const char *key, char *error, size_t erro
     return 0;
 }
 
+static int parse_integer(char *value, int minimum, int maximum, int *output,
+                         char *error, size_t error_size)
+{
+    char *cursor = forge_util_trim(value);
+    char *end = NULL;
+    long parsed;
+
+    if (*cursor == '\0') {
+        forge_util_set_error(error, error_size, "expected an integer");
+        return -1;
+    }
+    parsed = strtol(cursor, &end, 10);
+    if (end == cursor || *forge_util_trim(end) != '\0' ||
+        parsed < minimum || parsed > maximum) {
+        forge_util_set_error(error, error_size,
+                  "expected an integer between %d and %d", minimum, maximum);
+        return -1;
+    }
+    *output = (int)parsed;
+    return 0;
+}
+
+static int parse_boolean(char *value, int *output, char *error, size_t error_size)
+{
+    char *cursor = forge_util_trim(value);
+
+    if (strcmp(cursor, "true") == 0) {
+        *output = 1;
+        return 0;
+    }
+    if (strcmp(cursor, "false") == 0) {
+        *output = 0;
+        return 0;
+    }
+    forge_util_set_error(error, error_size, "expected 'true' or 'false'");
+    return -1;
+}
+
+/* Applies a profile section assignment, sharing the parser between
+ * [profile.debug] and [profile.release]. */
+static int parse_profile_assignment(ForgeProfileSeen *seen, ForgeBuildProfile *profile,
+                                    const char *key, char *value,
+                                    char *error, size_t error_size)
+{
+    if (strcmp(key, "opt-level") == 0) {
+        return reject_duplicate(&seen->opt_level, key, error, error_size) ||
+               parse_integer(value, 0, 3, &profile->opt_level, error, error_size);
+    }
+    if (strcmp(key, "debug") == 0) {
+        return reject_duplicate(&seen->debug_info, key, error, error_size) ||
+               parse_boolean(value, &profile->debug_info, error, error_size);
+    }
+    if (strcmp(key, "warnings-as-errors") == 0) {
+        return reject_duplicate(&seen->warnings_as_errors, key, error, error_size) ||
+               parse_boolean(value, &profile->warnings_as_errors, error, error_size);
+    }
+    if (strcmp(key, "std") == 0) {
+        return reject_duplicate(&seen->std_version, key, error, error_size) ||
+               parse_scalar(value, profile->std_version, sizeof(profile->std_version),
+                            error, error_size);
+    }
+    if (strcmp(key, "cflags") == 0) {
+        return reject_duplicate(&seen->cflags, key, error, error_size) ||
+               parse_string_list(value, &profile->cflags, error, error_size);
+    }
+    forge_util_set_error(error, error_size, "field '%s' is not allowed in this section", key);
+    return -1;
+}
+
 static int parse_assignment(ForgeManifestSection section, char *line,
                             ForgeManifest *manifest, ForgeManifestSeen *seen,
                             char *error, size_t error_size)
@@ -256,20 +334,18 @@ static int parse_assignment(ForgeManifestSection section, char *line,
                parse_scalar(value, manifest->compiler_override,
                             sizeof(manifest->compiler_override), error, error_size);
     }
-    if (section == FORGE_SECTION_PROFILE_DEBUG && strcmp(key, "cflags") == 0) {
-        return reject_duplicate(&seen->debug_cflags, key, error, error_size) ||
-               parse_string_list(value, &manifest->debug_profile.cflags, error, error_size);
+if (section == FORGE_SECTION_PROFILE_DEBUG) {
+        return parse_profile_assignment(&seen->debug, &manifest->debug_profile,
+                                        key, value, error, error_size);
     }
-    if (section == FORGE_SECTION_PROFILE_RELEASE && strcmp(key, "cflags") == 0) {
-        return reject_duplicate(&seen->release_cflags, key, error, error_size) ||
-               parse_string_list(value, &manifest->release_profile.cflags,
-                                 error, error_size);
+    if (section == FORGE_SECTION_PROFILE_RELEASE) {
+        return parse_profile_assignment(&seen->release, &manifest->release_profile,
+                                        key, value, error, error_size);
     }
 
     forge_util_set_error(error, error_size, "field '%s' is not allowed in this section", key);
     return -1;
 }
-
 int forge_manifest_load(const char *path, ForgeManifest *manifest,
                         char *error, size_t error_size)
 {
@@ -284,6 +360,8 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
         return -1;
     }
     *manifest = (ForgeManifest){0};
+    manifest->debug_profile.opt_level = -1;
+    manifest->release_profile.opt_level = -1;
     file = fopen(path, "r");
     if (file == NULL) {
         forge_util_set_error(error, error_size, "could not open manifest '%s'", path);
@@ -333,11 +411,9 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
     }
     (void)fclose(file);
 
-    if (!seen.project_name || !seen.target_os || !seen.target_arch ||
-        !seen.debug_cflags || !seen.release_cflags) {
+    if (!seen.project_name || !seen.target_os || !seen.target_arch) {
         forge_util_set_error(error, error_size,
-                  "%s: manifest requires project.name, targets.os/arch, "
-                  "and profile.debug/release cflags", path);
+                  "%s: manifest requires project.name and targets.os/arch", path);
         return -1;
     }
     if (manifest->c_source_dirs.count == 0U && manifest->cpp_source_dirs.count == 0U &&
