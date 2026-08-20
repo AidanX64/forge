@@ -29,6 +29,17 @@ int forge_paths_remove_tree(const char *path, char *error, size_t error_size);
 int forge_paths_project_root(const char *manifest_path, char *root,
                              size_t root_size, char *error, size_t error_size);
 
+/*
+ * Searches the current working directory and each parent for `manifest_name`.
+ * Returns 1 with the path in `found` when found, 0 when no ancestor contains
+ * it, and -1 when the search itself failed (buffer limits, OS error).
+ */
+int forge_paths_find_manifest(const char *manifest_name, char *found,
+                              size_t found_size);
+
+/* Copies the current working directory into `buffer`. Returns 0 on success. */
+int forge_paths_current_directory(char *buffer, size_t buffer_size);
+
 /* Maps `project_name` to a portable executable base name: all characters that
  * are not alphanumeric, '-', '_', or '.' become '-'. */
 void forge_paths_safe_output_name(const char *project_name, char *output,

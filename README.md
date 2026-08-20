@@ -32,11 +32,13 @@ of raw C.)
 ## Project layout
 
 - `src/cli.c` parses command-line arguments.
-- `src/commands.c` owns `run`, `debug`, and `clean` invocation lifecycles.
+- `src/commands.c` owns the subcommand invocation lifecycles (`build`, `check`,
+  `run`, `test`, `debug`, `clean`, `new`, `init`).
 - `src/orchestrator.c` is the build engine: source discovery, compiler dispatch,
   output layout, and build execution (compiles run on a thread pool).
 - `src/manifest.c`, `src/compiler.c`, `src/flags.c`, `src/log.c`, and
   `src/debug.c` provide the focused subsystems used by the build engine.
+- `src/scaffold.c` generates new project skeletons for `forge new` / `forge init`.
 - `src/flags.c` translates portable profile fields into each compiler's flag
   dialect (`-g`/`-O*` for GCC/Clang, `/Zi`/`/Od` for MSVC).
 - `src/argv.c`, `src/process.c`, and `src/thread.c` provide the dynamic
@@ -48,7 +50,8 @@ of raw C.)
 
 ## Building from source
 
-Forge is written in C11 and builds itself with `gcc` or `clang` — no other
+Forge is written in C23 (built with `-std=c2x` for toolchain compatibility)
+and builds itself with `gcc` or `clang` — no other
 toolchain required. The only dependency is a C compiler.
 
 ### Make (Linux / macOS / Windows with GNU make)
@@ -121,15 +124,23 @@ forge --help
 ## Quickstart
 
 ```sh
-cd <your-project>       # any dir with a Forge.toml + src/
-forge run               # build (debug) and run
-forge run --release     # build (release) and run
-forge run -j 8          # compile up to 8 translation units in parallel
-forge debug             # build, then launch a debugger
-forge clean             # remove the project's target/ output
+forge new my-app         # scaffold a project (Forge.toml + src/main.c)
+cd my-app
+forge run                # build (debug) and run
+forge run --release      # build (release) and run
+forge run -- --verbose   # arguments after -- go to your program
+forge run -j 8           # compile up to 8 translation units in parallel
+forge check              # fast compile-only validation, no link
+forge test               # build & run every tests/*.c as its own binary
+forge debug              # build, then launch a debugger
+forge clean              # remove the project's target/ output
 forge run --manifest path/to/Forge.toml
-                        # build another project without cd-ing into it
+                         # build another project without cd-ing into it
 ```
+
+Forge finds `Forge.toml` in the current directory or any parent, so you can
+invoke it from a subdirectory of your project. `forge run` exits with your
+program's own exit code.
 
 Try it immediately against the bundled fixture:
 
@@ -143,6 +154,11 @@ forge run --release     # prints "Hello world!"
 ### Build orchestration
 Simple, Cargo-style commands (`forge run`, `forge run --release`, ...)
 replace verbose, hand-rolled Makefiles/build scripts.
+
+`forge new <name>` scaffolds a ready-to-build project (manifest, hello-world
+`src/main.c`, `.gitignore`) and validates the generated manifest with forge's
+own parser; `forge init` does the same in the current directory, naming the
+project after it.
 
 Compilation is parallel: sources are compiled by a job pool sized to the host's
 logical processors by default (`-j N` overrides; `-j auto` restores the
@@ -161,6 +177,16 @@ Processes are spawned directly with an argv array (`CreateProcess` /
 or metacharacters are passed literally. Commands that would exceed the OS
 command-line limit spill the object list and flags into a compiler response
 file (`@target/<profile>/link.rsp`) automatically.
+
+### Fast validation and tests
+
+`forge check` compiles every translation unit without linking — a quick
+way to catch errors while editing, with incremental skips on repeat runs.
+
+`forge test` builds each `tests/*.c` file as its own self-contained binary
+(each file has its own `main`), runs them all, prints a
+`test result: N passed; M failed` summary, and exits nonzero when any fail.
+A missing or empty `tests/` directory is not an error.
 
 ### Cross-platform compiler dispatch
 Forge detects the host OS and version at build time and automatically
@@ -236,10 +262,11 @@ not just machine-parsed.
 
 ## Status
 
-v1 build orchestration is implemented and working: `forge run`,
-`forge run --release`, and `forge debug` build, link, log, and execute on the
-host. Compiler dispatch, manifest parsing, and per-invocation `target/logs`
-are in place.
+v1 build orchestration is implemented and working: `forge build`, `forge
+check`, `forge run` (with `--` argument passthrough and exit-code
+propagation), `forge test`, `forge debug`, `forge clean`, `forge new`, and
+`forge init` cover the host build loop. Compiler dispatch, manifest parsing,
+upward manifest discovery, and per-invocation `target/logs` are in place.
 
 ## Author note 
 

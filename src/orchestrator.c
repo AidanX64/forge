@@ -21,10 +21,10 @@
 #include <windows.h>
 #else
 #include <dirent.h>
-#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 #endif
+#include <sys/stat.h>
 
 #include "forge/argv.h"
 #include "forge/compiler.h"
@@ -355,13 +355,26 @@ static int run_compile_pool(ForgeCompileContext *context, int max_jobs)
     return context->failed ? -1 : 0;
 }
 
-int forge_build_project(const char *project_root, const ForgeManifest *manifest,
-                        int release, int should_run, int max_jobs,
-                        char *built_executable, size_t built_executable_size)
+/*
+ * The shared build pipeline behind every compile/link/run style command.
+ * `sources_override` (a shallow list, never owned) replaces manifest source
+ * discovery so the test runner can build one binary per test file, and
+ * `output_name_override` replaces the sanitized project name as the
+ * executable base name.
+ */
+static int build_binary(const char *project_root, const ForgeManifest *manifest,
+                        ForgeBuildMode mode, int release, int max_jobs,
+                        const ForgeSourceList *sources_override,
+                        const char *output_name_override,
+                        const char *const *program_arguments,
+                        size_t program_argument_count,
+                        char *built_executable, size_t built_executable_size,
+                        int *child_exit_code)
 {
     ForgeHostInfo host;
     ForgeCompiler compiler;
     ForgeSourceList sources = {0};
+    int owns_sources;
     const ForgeBuildProfile *profile;
     const char *target_os;
     const char *target_arch;
@@ -378,24 +391,39 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     char (*used_object_names)[FORGE_PATH_MAX] = NULL;
     const char **object_references = NULL;
     size_t source_index;
+    size_t argument_index;
     size_t used_count = 0U;
     int used_response_file = 0;
     int exit_code;
     int result = -1;
 
+    if (child_exit_code != NULL) {
+        *child_exit_code = 0;
+    }
     if (forge_detect_host(&host, error, sizeof(error)) != 0) {
         print_error("%s", error);
         goto cleanup;
     }
     if (select_host_target(manifest, &host, &target_os, &target_arch) != 0 ||
         forge_compiler_select(&host, manifest->compiler_override, &compiler,
-                              error, sizeof(error)) != 0 ||
-        forge_sources_collect(project_root, manifest, &sources, error,
-                        sizeof(error)) != 0) {
+                              error, sizeof(error)) != 0) {
         if (error[0] != '\0') {
             print_error("%s", error);
         }
         goto cleanup;
+    }
+    if (sources_override != NULL) {
+        sources = *sources_override;
+        owns_sources = 0;
+    } else {
+        if (forge_sources_collect(project_root, manifest, &sources, error,
+                                  sizeof(error)) != 0) {
+            if (error[0] != '\0') {
+                print_error("%s", error);
+            }
+            goto cleanup;
+        }
+        owns_sources = 1;
     }
 
     profile = release ? &manifest->release_profile : &manifest->debug_profile;
@@ -414,8 +442,13 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
         }
         goto cleanup;
     }
-    forge_paths_safe_output_name(manifest->project_name, executable_name,
-                                 sizeof(executable_name));
+    if (output_name_override != NULL) {
+        forge_paths_safe_output_name(output_name_override, executable_name,
+                                     sizeof(executable_name));
+    } else {
+        forge_paths_safe_output_name(manifest->project_name, executable_name,
+                                     sizeof(executable_name));
+    }
 #if FORGE_PLATFORM_WINDOWS
     if (snprintf(executable_path, sizeof(executable_path), "%s/%s.exe",
                  profile_directory, executable_name) < 0 ||
@@ -482,6 +515,13 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     forge_mutex_destroy(&context.job_mutex);
     forge_mutex_destroy(&context.log_mutex);
 
+    if (mode == FORGE_BUILD_MODE_COMPILE_ONLY) {
+        forge_logger_log(active_logger, "check",
+                         "check: all %zu translation unit(s) compiled", sources.count);
+        result = 0;
+        goto cleanup;
+    }
+
     argv = (ForgeArgv){0};
     if (forge_compiler_make_link_argv(&compiler, context.has_cpp_source, object_references,
                                       sources.count, executable_path, profile_directory,
@@ -520,7 +560,7 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
             goto cleanup;
         }
     }
-    if (!should_run) {
+    if (mode != FORGE_BUILD_MODE_RUN) {
         result = 0;
         goto cleanup;
     }
@@ -529,6 +569,12 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
     if (forge_argv_append(&argv, executable_path) != 0) {
         print_error("out of memory while preparing run command");
         goto cleanup;
+    }
+    for (argument_index = 0U; argument_index < program_argument_count; ++argument_index) {
+        if (forge_argv_append(&argv, program_arguments[argument_index]) != 0) {
+            print_error("out of memory while preparing run command");
+            goto cleanup;
+        }
     }
     (void)forge_argv_finalize(&argv);
     if (forge_argv_join(display, sizeof(display), &argv) == 0) {
@@ -541,10 +587,13 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
         goto cleanup;
     }
     forge_argv_free(&argv);
+    if (child_exit_code != NULL) {
+        *child_exit_code = exit_code;
+    }
+    /* A failing program is not a failing build pipeline; callers decide what
+     * the child's code means (forge run propagates it, forge test records it). */
     if (exit_code != 0) {
-        print_error("program failed");
-        print_log_tail(24U);
-        goto cleanup;
+        forge_logger_log(active_logger, "run", "exit: %d", exit_code);
     }
     result = 0;
 
@@ -553,8 +602,129 @@ cleanup:
     free(object_references);
     free(used_object_names);
     free(object_paths);
-    forge_sources_free(&sources);
+    if (owns_sources) {
+        forge_sources_free(&sources);
+    }
     return result;
+}
+
+int forge_build_project(const char *project_root, const ForgeManifest *manifest,
+                        ForgeBuildMode mode, int release, int max_jobs,
+                        const char *const *program_arguments,
+                        size_t program_argument_count,
+                        char *built_executable, size_t built_executable_size,
+                        int *child_exit_code)
+{
+    return build_binary(project_root, manifest, mode, release, max_jobs,
+                        NULL, NULL, program_arguments, program_argument_count,
+                        built_executable, built_executable_size, child_exit_code);
+}
+
+/* Extracts the sanitized base name of `path` without its extension so each
+ * test file becomes its own executable name. */
+static void test_binary_name(const char *path, char *output, size_t output_size)
+{
+    const char *slash = strrchr(path, '/');
+    const char *backslash = strrchr(path, '\\');
+    const char *base = path;
+    const char *dot;
+    char stem[FORGE_MANIFEST_VALUE_MAX];
+    size_t length;
+
+    if (slash != NULL && slash + 1 > base) {
+        base = slash + 1;
+    }
+    if (backslash != NULL && backslash + 1 > base) {
+        base = backslash + 1;
+    }
+    dot = strrchr(base, '.');
+    length = dot != NULL && dot > base ? (size_t)(dot - base) : strlen(base);
+    if (length >= sizeof(stem)) {
+        length = sizeof(stem) - 1U;
+    }
+    memcpy(stem, base, length);
+    stem[length] = '\0';
+    forge_paths_safe_output_name(stem, output, output_size);
+}
+
+/*
+ * Builds and runs every standalone test source in <root>/tests. Each test
+ * file must be self-contained (own main); binaries land next to the normal
+ * build outputs and run in the requested profile. Returns 0 when every test
+ * passed, 1 when any failed, -1 only when the harness itself broke.
+ */
+int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
+                      int release, int max_jobs)
+{
+    ForgeManifest test_manifest = *manifest;
+    ForgeSourceList tests = {0};
+    char error[FORGE_COMMAND_MAX] = {0};
+    char tests_directory[FORGE_PATH_MAX];
+    struct stat details;
+    size_t index;
+    size_t passed = 0U;
+    size_t failed = 0U;
+
+    if (forge_paths_join(tests_directory, sizeof(tests_directory), project_root,
+                         "tests") != 0) {
+        print_error("tests directory path is too long");
+        return -1;
+    }
+    /* No tests/ directory is a normal state, not an error. */
+    if (stat(tests_directory, &details) != 0 || !S_ISDIR(details.st_mode)) {
+        forge_logger_log(active_logger, "test",
+                         "no tests found in tests/ (create tests/*.c with their own main)");
+        return 0;
+    }
+    test_manifest.c_source_dirs.count = 1U;
+    (void)snprintf(test_manifest.c_source_dirs.items[0],
+                   sizeof(test_manifest.c_source_dirs.items[0]), "%s", "tests");
+    test_manifest.cpp_source_dirs.count = 0U;
+    test_manifest.asm_source_dirs.count = 0U;
+    if (forge_sources_collect(project_root, &test_manifest, &tests, error,
+                              sizeof(error)) != 0) {
+        print_error("%s", error);
+        return -1;
+    }
+    if (tests.count == 0U) {
+        forge_logger_log(active_logger, "test",
+                         "no tests found in tests/ (create tests/*.c with their own main)");
+        forge_sources_free(&tests);
+        return 0;
+    }
+    for (index = 0U; index < tests.count; ++index) {
+        ForgeSourceList single;
+        char name[FORGE_MANIFEST_VALUE_MAX];
+        int child_exit_code = 0;
+        int status;
+
+        test_binary_name(tests.items[index].path, name, sizeof(name));
+        single.items = &tests.items[index];
+        single.count = 1U;
+        single.capacity = 0U;
+        forge_logger_log(active_logger, "test", "----- test %s (%s) -----",
+                         name, tests.items[index].path);
+        status = build_binary(project_root, manifest, FORGE_BUILD_MODE_RUN, release,
+                              max_jobs, &single, name, NULL, 0U, NULL, 0U,
+                              &child_exit_code);
+        if (status != 0) {
+            ++failed;
+            print_log_tail(24U);
+            continue;
+        }
+        if (child_exit_code == 0) {
+            ++passed;
+            forge_logger_log(active_logger, "test", "passed: %s", name);
+        } else {
+            ++failed;
+            forge_logger_log(active_logger, "test", "failed: %s (exit %d)",
+                             name, child_exit_code);
+        }
+    }
+    forge_sources_free(&tests);
+    forge_logger_log(active_logger, "test", "test result: %zu passed; %zu failed",
+                     passed, failed);
+    return failed == 0U ? 0 : 1;
 }
 
 void forge_build_set_logger(ForgeLogger *logger)

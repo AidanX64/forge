@@ -107,6 +107,82 @@ int forge_paths_project_root(const char *manifest_path, char *root,
     return 0;
 }
 
+/* Truncates `path` in place to its parent directory. Returns 0 when a parent
+ * was produced and -1 when `path` is already top-most ("/", "C:\", or a bare
+ * relative component). */
+static int parent_directory(char *path)
+{
+    size_t length = strlen(path);
+    size_t index = length;
+
+    while (index > 0U && path[index - 1U] != '/' && path[index - 1U] != '\\') {
+        --index;
+    }
+    if (index == 0U) {
+        return -1;
+    }
+    /* Keep the separator itself only at a filesystem root ("C:\", "/"). */
+    if (index == 1U || (index == 3U && path[1] == ':')) {
+        if (strlen(path) == index) {
+            return -1;
+        }
+        path[index] = '\0';
+    } else {
+        path[index - 1U] = '\0';
+    }
+    return 0;
+}
+
+int forge_paths_find_manifest(const char *manifest_name, char *found,
+                              size_t found_size)
+{
+    char current[FORGE_PATH_MAX];
+    char candidate[FORGE_PATH_MAX];
+
+    if (forge_paths_current_directory(current, sizeof(current)) != 0) {
+        return -1;
+    }
+    for (;;) {
+        FILE *probe;
+        size_t length_before = strlen(current);
+
+        if (forge_paths_join(candidate, sizeof(candidate), current,
+                             manifest_name) != 0) {
+            return -1;
+        }
+        probe = fopen(candidate, "r");
+        if (probe != NULL) {
+            (void)fclose(probe);
+            if (snprintf(found, found_size, "%s", candidate) < 0 ||
+                strlen(candidate) >= found_size) {
+                return -1;
+            }
+            return 1;
+        }
+        if (parent_directory(current) != 0 || strlen(current) >= length_before) {
+            return 0;
+        }
+    }
+}
+
+int forge_paths_current_directory(char *buffer, size_t buffer_size)
+{
+#if FORGE_PLATFORM_WINDOWS
+    /* Returns the length written, or the required size when the buffer is
+     * too small; either way a value >= buffer_size means it did not fit. */
+    DWORD length = GetCurrentDirectoryA((DWORD)buffer_size, buffer);
+
+    if (length == 0U || length >= (DWORD)buffer_size) {
+        return -1;
+    }
+#else
+    if (getcwd(buffer, buffer_size) == NULL) {
+        return -1;
+    }
+#endif
+    return 0;
+}
+
 static int make_directory(const char *path, char *error, size_t error_size)
 {
 #if FORGE_PLATFORM_WINDOWS

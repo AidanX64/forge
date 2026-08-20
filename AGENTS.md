@@ -76,6 +76,16 @@ as possible, regardless of target OS, architecture, or toolchain.
 4. `cd test && forge run` — exercises manifest discovery and
    project-root anchoring from a plain working directory.
 
+### Subcommand conventions
+- Subcommands: `build`, `check`, `run`, `test`, `debug`, `clean`, `new`,
+  `init`. New ones must stay Cargo-like verbs and compose with
+  `forge <verb> --release`.
+- `forge run -- ARGS...` passes ARGS to the program and propagates its exit
+  code; keep that contract for anything that spawns user programs.
+- `forge test` builds each `tests/*.c` as a self-contained binary (own
+  `main`); missing/empty `tests/` exits 0.
+- The forge version string lives in `include/forge/version.h`.
+
 ### Incremental-build caveats
 - Objects are skipped when the source and every header the compiler recorded
   (`-MMD -MF` depfiles, `target/{debug,release}/obj/*.d`) are older than the
