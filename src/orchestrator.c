@@ -117,6 +117,183 @@ static int read_path_list(const char *file_path, ForgePathList *list)
     return 0;
 }
 
+/*
+ * Link-level freshness. After a successful link, forge records every input
+ * state — each object's and library's exact mtime plus the manifest's — in a
+ * small stamp file next to the executable. A later run relinks only when the
+ * executable is missing or the recorded states no longer match, which is the
+ * same contract Cargo's fingerprint provides: source edits change mtimes,
+ * adding/removing sources changes the list itself, and profile edits touch
+ * the manifest.
+ */
+
+typedef struct ForgeTextBuilder {
+    char *text;
+    size_t length;
+    size_t capacity;
+} ForgeTextBuilder;
+
+static int text_builder_add(ForgeTextBuilder *builder, const char *line)
+{
+    size_t line_length = strlen(line);
+
+    if (builder->length + line_length + 1U > builder->capacity) {
+        size_t new_capacity = builder->capacity == 0U ? 4096U : builder->capacity;
+        char *grown;
+
+        while (builder->length + line_length + 1U > new_capacity) {
+            new_capacity *= 2U;
+        }
+        grown = realloc(builder->text, new_capacity);
+        if (grown == NULL) {
+            return -1;
+        }
+        builder->text = grown;
+        builder->capacity = new_capacity;
+    }
+    memcpy(builder->text + builder->length, line, line_length);
+    builder->length += line_length;
+    builder->text[builder->length] = '\0';
+    return 0;
+}
+
+static void text_builder_free(ForgeTextBuilder *builder)
+{
+    free(builder->text);
+    builder->text = NULL;
+    builder->length = 0U;
+    builder->capacity = 0U;
+}
+
+/* Appends "kind<TAB>path<TAB>mtime\n" for one link input. Paths are recorded
+ * fully normalized so the stamp text never depends on how forge was invoked
+ * (a relative --manifest argument vs upward discovery from a subdirectory). */
+static int stamp_add_input(ForgeTextBuilder *builder, const char *kind,
+                           const char *path)
+{
+    char mtime[64];
+    char absolute[FORGE_PATH_MAX];
+    char line[FORGE_PATH_MAX + 96U];
+
+    if (forge_paths_absolute(path, absolute, sizeof(absolute)) != 0) {
+        (void)snprintf(absolute, sizeof(absolute), "%s", path);
+    }
+    forge_fingerprint_mtime_text(absolute, mtime, sizeof(mtime));
+    if ((size_t)snprintf(line, sizeof(line), "%s\t%s\t%s\n", kind, absolute,
+                         mtime) >= sizeof(line)) {
+        return -1;
+    }
+    return text_builder_add(builder, line);
+}
+
+static int read_whole_file_text(const char *path, char **contents, size_t *size)
+{
+    FILE *file = fopen(path, "rb");
+    long length;
+
+    *contents = NULL;
+    *size = 0U;
+    if (file == NULL) {
+        return -1;
+    }
+    if (fseek(file, 0L, SEEK_END) != 0 || (length = ftell(file)) < 0L ||
+        fseek(file, 0L, SEEK_SET) != 0) {
+        (void)fclose(file);
+        return -1;
+    }
+    /* An empty stamp is never valid, so treat it as absent. */
+    if (length == 0L) {
+        (void)fclose(file);
+        return -1;
+    }
+    *contents = malloc((size_t)length + 1U);
+    if (*contents == NULL) {
+        (void)fclose(file);
+        return -1;
+    }
+    *size = fread(*contents, 1U, (size_t)length, file);
+    (void)fclose(file);
+    (*contents)[*size] = '\0';
+    return 0;
+}
+
+/*
+ * Builds the exact stamp text describing this set of link inputs. Always
+ * called before deciding anything, so a fresh link can record what it built
+ * even on the very first build (when there is nothing to compare against).
+ */
+static int build_link_expected(ForgeTextBuilder *expected,
+                               const char *manifest_path_for_freshness,
+                               const char *const *object_paths, size_t object_count,
+                               const char *const *extra_inputs, size_t extra_count)
+{
+    memset(expected, 0, sizeof(*expected));
+    if (text_builder_add(expected, "forge-link-stamp v1\n") != 0) {
+        return -1;
+    }
+    if (manifest_path_for_freshness != NULL &&
+        stamp_add_input(expected, "manifest", manifest_path_for_freshness) != 0) {
+        return -1;
+    }
+    for (size_t index = 0U; index < object_count; ++index) {
+        if (object_paths[index] != NULL &&
+            stamp_add_input(expected, "object", object_paths[index]) != 0) {
+            return -1;
+        }
+    }
+    for (size_t index = 0U; index < extra_count; ++index) {
+        if (extra_inputs[index] != NULL && extra_inputs[index][0] != '\0' &&
+            stamp_add_input(expected, "library", extra_inputs[index]) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Returns 1 when `executable_path` exists and the stamp beside it still
+ * describes exactly the inputs captured in `expected`.
+ */
+static int link_is_fresh(const char *executable_path, const char *stamp_path,
+                         const ForgeTextBuilder *expected,
+                         struct stat *executable_stat)
+{
+    char *recorded = NULL;
+    size_t recorded_size = 0U;
+    int fresh = 0;
+
+    if (stat(executable_path, executable_stat) != 0 ||
+        !S_ISREG(executable_stat->st_mode)) {
+        return 0;
+    }
+    if (read_whole_file_text(stamp_path, &recorded, &recorded_size) == 0) {
+        fresh = recorded_size == expected->length &&
+                memcmp(recorded, expected->text, recorded_size) == 0;
+        free(recorded);
+    }
+    return fresh;
+}
+
+static void write_link_stamp(const char *stamp_path, const ForgeTextBuilder *expected,
+                             const char *executable_name)
+{
+    FILE *file = fopen(stamp_path, "wb");
+
+    if (file == NULL) {
+        /* Without a stamp the next build simply relinks once more. */
+        forge_logger_log(active_logger, "link",
+                         "note: could not record the link stamp for %s "
+                         "(future runs will relink)", executable_name);
+        return;
+    }
+    if (fwrite(expected->text, 1U, expected->length, file) != expected->length) {
+        forge_logger_log(active_logger, "link",
+                         "note: could not finish the link stamp for %s",
+                         executable_name);
+    }
+    (void)fclose(file);
+}
+
 static const char *log_capture_path(void)
 {
     return (active_logger != NULL && active_logger->path[0] != '\0')
@@ -285,7 +462,11 @@ typedef struct ForgeCompileContext {
     const char *target_arch;
     size_t count;
     size_t next;
-    int has_cpp_source;
+    /* Counters and failure state shared by workers; every access holds
+     * job_mutex (has_cpp_source is derived after the pool joins instead,
+     * so it needs no locking). */
+    size_t compiled;
+    size_t skipped;
     int failed;
     char error[FORGE_COMMAND_MAX];
     ForgeMutex job_mutex;
@@ -316,6 +497,17 @@ static void compile_fail(ForgeCompileContext *context, const char *message)
     forge_mutex_unlock(&context->job_mutex);
 }
 
+static void compile_count(ForgeCompileContext *context, int was_skipped)
+{
+    forge_mutex_lock(&context->job_mutex);
+    if (was_skipped) {
+        ++context->skipped;
+    } else {
+        ++context->compiled;
+    }
+    forge_mutex_unlock(&context->job_mutex);
+}
+
 static void compile_source_job(ForgeCompileContext *context, size_t source_index)
 {
     const char *source_path = context->sources->items[source_index].path;
@@ -331,9 +523,7 @@ static void compile_source_job(ForgeCompileContext *context, size_t source_index
     if (forge_fingerprint_object_fresh(object_path, source_path, track_headers)) {
         compile_log(context, "compile", "up-to-date: %s", source_path);
         context->object_references[source_index] = object_path;
-        if (context->sources->items[source_index].language == FORGE_SOURCE_CPP) {
-            context->has_cpp_source = 1;
-        }
+        compile_count(context, 1);
         return;
     }
     if (forge_compiler_make_compile_argv(context->compiler,
@@ -364,9 +554,7 @@ static void compile_source_job(ForgeCompileContext *context, size_t source_index
         return;
     }
     context->object_references[source_index] = object_path;
-    if (context->sources->items[source_index].language == FORGE_SOURCE_CPP) {
-        context->has_cpp_source = 1;
-    }
+    compile_count(context, 0);
 }
 
 static void compile_worker(void *argument)
@@ -439,9 +627,11 @@ static int run_compile_pool(ForgeCompileContext *context, int max_jobs)
  * `output_name_override` replaces the sanitized project name as the
  * executable base name. When `resolve_dependencies` is set, [dependencies]
  * are resolved and built first and their headers/objects feed this build;
- * dependency builds recurse with the flag cleared.
+ * dependency builds recurse with the flag cleared (and without a manifest
+ * path, since dep objects carry their own freshness through mtimes).
  */
 static int build_binary_inner(const char *project_root, const ForgeManifest *manifest,
+                              const char *manifest_path_for_freshness,
                               ForgeBuildMode mode, int release, int max_jobs,
                               const ForgeSourceList *sources_override,
                               const char *output_name_override,
@@ -471,12 +661,14 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     char executable_name[FORGE_MANIFEST_VALUE_MAX];
     char executable_path[FORGE_PATH_MAX];
     char display[FORGE_COMMAND_MAX];
+    char stamp_path[FORGE_PATH_MAX];
     char (*object_paths)[FORGE_PATH_MAX] = NULL;
     char (*used_object_names)[FORGE_PATH_MAX] = NULL;
     const char **object_references = NULL;
     size_t source_index;
     size_t argument_index;
     size_t used_count = 0U;
+    int has_cpp_source = 0;
     int used_response_file = 0;
     int exit_code;
     int result = -1;
@@ -514,8 +706,8 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
      * project's own sources compile: their headers feed the compile lines
      * and their objects/libraries the link line. */
     if (resolve_dependencies && manifest->dependencies.count > 0U) {
-        if (forge_deps_resolve(project_root, manifest, 0, &dep_graph, active_logger,
-                               error, sizeof(error)) != 0) {
+        if (forge_deps_resolve(project_root, manifest, 0, NULL, &dep_graph,
+                               active_logger, error, sizeof(error)) != 0) {
             print_error("%s", error);
             goto cleanup;
         }
@@ -531,8 +723,9 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
 
                 if (node->is_native) {
                     if (build_binary_inner(node->root, node->manifest,
+                                           NULL,
                                            FORGE_BUILD_MODE_DEP_OBJECTS, release,
-                                           max_jobs, NULL, 0U, NULL, 0U,
+                                           max_jobs, NULL, NULL, NULL, 0U,
                                            node->link_artifact,
                                            sizeof(node->link_artifact),
                                            NULL, 0) != 0) {
@@ -640,6 +833,17 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     forge_mutex_destroy(&context.job_mutex);
     forge_mutex_destroy(&context.log_mutex);
 
+    /* Derived post-pool rather than inside workers: writing a plain flag from
+     * several threads would be an unsynchronized data race. */
+    for (source_index = 0U; source_index < sources.count; ++source_index) {
+        if (sources.items[source_index].language == FORGE_SOURCE_CPP) {
+            has_cpp_source = 1;
+            break;
+        }
+    }
+    forge_logger_log(active_logger, "compile",
+                     "compiled %zu, up-to-date %zu", context.compiled, context.skipped);
+
     if (mode == FORGE_BUILD_MODE_COMPILE_ONLY) {
         forge_logger_log(active_logger, "check",
                          "check: all %zu translation unit(s) compiled", sources.count);
@@ -702,39 +906,79 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
         }
     }
 
-    argv = (ForgeArgv){0};
-    if (forge_compiler_make_link_argv(&compiler, context.has_cpp_source, object_references,
-                                      sources.count,
-                                      (const char *const *)dep_link_inputs.items,
-                                      dep_link_inputs.count, executable_path,
-                                      profile_directory, profile, &argv,
-                                      &used_response_file, error,
-                                      sizeof(error)) != 0) {
-        print_error("%s", error);
-        goto cleanup;
-    }
-    forge_logger_log(active_logger, "link", "----- link %s -----", executable_path);
-    (void)forge_argv_finalize(&argv);
-    if (forge_argv_join(display, sizeof(display), &argv) == 0) {
-        forge_logger_log(active_logger, "link", "command: %s", display);
-    }
-    if (used_response_file) {
-        forge_logger_log(active_logger, "link",
-                         "long link line: objects and flags spilled to %s/link.rsp",
-                         profile_directory);
-    }
-    exit_code = 0;
-    if (forge_process_run(argv.items, log_capture_path(), 1,
-                          &exit_code, error, sizeof(error)) != 0) {
-        print_error("%s", error);
+    {
+        ForgeTextBuilder expected_stamp = {0};
+        struct stat executable_stat;
+        int fresh;
+
+        if ((size_t)snprintf(stamp_path, sizeof(stamp_path), "%s/%s.linkstamp",
+                             profile_directory, executable_name) >= sizeof(stamp_path)) {
+            print_error("link stamp path is too long");
+            goto cleanup;
+        }
+        if (build_link_expected(&expected_stamp, manifest_path_for_freshness,
+                                object_references, sources.count,
+                                (const char *const *)dep_link_inputs.items,
+                                dep_link_inputs.count) != 0) {
+            print_error("out of memory while recording link inputs");
+            goto cleanup;
+        }
+        fresh = link_is_fresh(executable_path, stamp_path, &expected_stamp,
+                              &executable_stat);
+        if (fresh) {
+            text_builder_free(&expected_stamp);
+            forge_logger_log(active_logger, "link", "up-to-date: %s", executable_path);
+            if (built_executable != NULL && built_executable_size != 0U) {
+                if (snprintf(built_executable, built_executable_size, "%s",
+                             executable_path) < 0 ||
+                    strlen(executable_path) >= built_executable_size) {
+                    print_error("built executable path is too long");
+                    goto cleanup;
+                }
+            }
+            if (mode != FORGE_BUILD_MODE_RUN) {
+                result = 0;
+                goto cleanup;
+            }
+            goto run_phase;
+        }
+
+        argv = (ForgeArgv){0};
+        if (forge_compiler_make_link_argv(&compiler, has_cpp_source, object_references,
+                                          sources.count,
+                                          (const char *const *)dep_link_inputs.items,
+                                          dep_link_inputs.count, executable_path,
+                                          profile_directory, profile, &argv,
+                                          &used_response_file, error,
+                                          sizeof(error)) != 0) {
+            print_error("%s", error);
+            goto cleanup;
+        }
+        forge_logger_log(active_logger, "link", "----- link %s -----", executable_path);
+        (void)forge_argv_finalize(&argv);
+        if (forge_argv_join(display, sizeof(display), &argv) == 0) {
+            forge_logger_log(active_logger, "link", "command: %s", display);
+        }
+        if (used_response_file) {
+            forge_logger_log(active_logger, "link",
+                             "long link line: objects and flags spilled to %s/link.rsp",
+                             profile_directory);
+        }
+        exit_code = 0;
+        if (forge_process_run(argv.items, log_capture_path(), 1,
+                              &exit_code, error, sizeof(error)) != 0) {
+            print_error("%s", error);
+            forge_argv_free(&argv);
+            goto cleanup;
+        }
         forge_argv_free(&argv);
-        goto cleanup;
-    }
-    forge_argv_free(&argv);
-    if (exit_code != 0) {
-        print_error("linker failed");
-        print_log_tail(24U);
-        goto cleanup;
+        if (exit_code != 0) {
+            print_error("linker failed");
+            print_log_tail(24U);
+            goto cleanup;
+        }
+        write_link_stamp(stamp_path, &expected_stamp, executable_name);
+        text_builder_free(&expected_stamp);
     }
     if (built_executable != NULL && built_executable_size != 0U) {
         if (snprintf(built_executable, built_executable_size, "%s", executable_path) < 0 ||
@@ -747,6 +991,8 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
         result = 0;
         goto cleanup;
     }
+
+run_phase:
     forge_logger_log(active_logger, "run", "----- run %s -----", executable_path);
     argv = (ForgeArgv){0};
     if (forge_argv_append(&argv, executable_path) != 0) {
@@ -794,16 +1040,17 @@ cleanup:
 }
 
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
+                        const char *manifest_path,
                         ForgeBuildMode mode, int release, int max_jobs,
                         const char *const *program_arguments,
                         size_t program_argument_count,
                         char *built_executable, size_t built_executable_size,
                         int *child_exit_code)
 {
-    return build_binary_inner(project_root, manifest, mode, release, max_jobs,
-                              NULL, NULL, program_arguments, program_argument_count,
-                              built_executable, built_executable_size, child_exit_code,
-                              1);
+    return build_binary_inner(project_root, manifest, manifest_path, mode, release,
+                              max_jobs, NULL, NULL, program_arguments,
+                              program_argument_count, built_executable,
+                              built_executable_size, child_exit_code, 1);
 }
 
 /* Extracts the sanitized base name of `path` without its extension so each
@@ -836,11 +1083,15 @@ static void test_binary_name(const char *path, char *output, size_t output_size)
 /*
  * Builds and runs every standalone test source in <root>/tests. Each test
  * file must be self-contained (own main); binaries land next to the normal
- * build outputs and run in the requested profile. Returns 0 when every test
- * passed, 1 when any failed, -1 only when the harness itself broke.
+ * build outputs and run in the requested profile. C, C++, and assembly
+ * sources are all eligible. When `test_filter` is non-NULL only the test
+ * whose binary name equals it runs, and a filter matching no test is an
+ * error. Returns 0 when every executed test passed, 1 when any failed,
+ * -1 when the harness itself broke (including a filter that matched nothing).
  */
 int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
-                      int release, int max_jobs)
+                      const char *manifest_path,
+                      int release, int max_jobs, const char *test_filter)
 {
     ForgeManifest test_manifest = *manifest;
     ForgeSourceList tests = {0};
@@ -850,6 +1101,7 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
     size_t index;
     size_t passed = 0U;
     size_t failed = 0U;
+    size_t run_count = 0U;
 
     if (forge_paths_join(tests_directory, sizeof(tests_directory), project_root,
                          "tests") != 0) {
@@ -862,11 +1114,17 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
                          "no tests found in tests/ (create tests/*.c with their own main)");
         return 0;
     }
+    /* All three language buckets point at tests/ so each collected file is
+     * tagged with the language its extension implies. */
     test_manifest.c_source_dirs.count = 1U;
     (void)snprintf(test_manifest.c_source_dirs.items[0],
                    sizeof(test_manifest.c_source_dirs.items[0]), "%s", "tests");
-    test_manifest.cpp_source_dirs.count = 0U;
-    test_manifest.asm_source_dirs.count = 0U;
+    test_manifest.cpp_source_dirs.count = 1U;
+    (void)snprintf(test_manifest.cpp_source_dirs.items[0],
+                   sizeof(test_manifest.cpp_source_dirs.items[0]), "%s", "tests");
+    test_manifest.asm_source_dirs.count = 1U;
+    (void)snprintf(test_manifest.asm_source_dirs.items[0],
+                   sizeof(test_manifest.asm_source_dirs.items[0]), "%s", "tests");
     if (forge_sources_collect(project_root, &test_manifest, &tests, error,
                               sizeof(error)) != 0) {
         print_error("%s", error);
@@ -885,12 +1143,18 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
         int status;
 
         test_binary_name(tests.items[index].path, name, sizeof(name));
+        if (test_filter != NULL && strcmp(name, test_filter) != 0 &&
+            strcmp(tests.items[index].path, test_filter) != 0) {
+            continue;
+        }
+        ++run_count;
         single.items = &tests.items[index];
         single.count = 1U;
         single.capacity = 0U;
         forge_logger_log(active_logger, "test", "----- test %s (%s) -----",
                          name, tests.items[index].path);
-        status = build_binary_inner(project_root, manifest, FORGE_BUILD_MODE_RUN, release,
+        status = build_binary_inner(project_root, manifest, manifest_path,
+                                    FORGE_BUILD_MODE_RUN, release,
                                     max_jobs, &single, name, NULL, 0U, NULL, 0U,
                                     &child_exit_code, 1);
         if (status != 0) {
@@ -908,6 +1172,13 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
         }
     }
     forge_sources_free(&tests);
+    if (test_filter != NULL && run_count == 0U) {
+        /* A filter that matches nothing is a user error, not a passing
+         * suite: silently exiting 0 could hide a typo'd --test name. */
+        forge_logger_error(active_logger, "test", "no test matched '%s'",
+                           test_filter);
+        return -1;
+    }
     forge_logger_log(active_logger, "test", "test result: %zu passed; %zu failed",
                      passed, failed);
     return failed == 0U ? 0 : 1;

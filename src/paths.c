@@ -56,6 +56,38 @@ int forge_paths_resolve(const char *root, const char *relative,
     return forge_paths_join(destination, destination_size, root, relative);
 }
 
+int forge_paths_absolute(const char *path, char *destination,
+                         size_t destination_size)
+{
+    char full[FORGE_PATH_MAX];
+
+    if (path == NULL || destination == NULL) {
+        return -1;
+    }
+#if FORGE_PLATFORM_WINDOWS
+    {
+        DWORD length = GetFullPathNameA(path, sizeof(full), full, NULL);
+        if (length == 0U || length >= sizeof(full)) {
+            full[0] = '\0';
+        }
+    }
+#else
+    if (realpath(path, full) == NULL) {
+        full[0] = '\0';
+    }
+#endif
+    /* Unresolvable paths keep their raw text so callers still get a usable
+     * key; the stamp comparison just stays sensitive to the exact spelling. */
+    if (full[0] == '\0' && snprintf(full, sizeof(full), "%s", path) < 0) {
+        return -1;
+    }
+    if (strlen(full) >= destination_size) {
+        return -1;
+    }
+    (void)snprintf(destination, destination_size, "%s", full);
+    return 0;
+}
+
 int forge_paths_project_root(const char *manifest_path, char *root,
                              size_t root_size, char *error, size_t error_size)
 {

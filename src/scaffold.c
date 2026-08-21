@@ -1,4 +1,3 @@
-#include <ctype.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -43,7 +42,9 @@ static const char *MAIN_TEMPLATE =
 static const char *GITIGNORE_TEMPLATE = "target/\n";
 
 /* Project names must survive the manifest parser and become portable output
- * names, so restrict them to the same charset forge uses for executables. */
+ * names, so restrict them to the same portable ASCII charset forge uses
+ * everywhere else (explicit ranges rather than isalnum, which is
+ * locale-dependent). */
 static int name_is_valid(const char *name)
 {
     size_t index;
@@ -54,8 +55,10 @@ static int name_is_valid(const char *name)
     for (index = 0U; name[index] != '\0'; ++index) {
         unsigned char character = (unsigned char)name[index];
 
-        if (!isalnum(character) && character != '-' && character != '_' &&
-            character != '.') {
+        if (!((character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') ||
+              character == '-' || character == '_' || character == '.')) {
             return 0;
         }
     }
@@ -80,9 +83,11 @@ static int write_text_file(const char *path, const char *contents,
 
 /* Writes the scaffold files into `project_dir` (creating its src/ directory)
  * and verifies the generated manifest actually parses before reporting
- * success. */
+ * success. When `refuse_existing` is set (forge init), any file that is
+ * already there aborts the scaffold instead of being overwritten — a
+ * hello-world must never replace someone's src/main.c. */
 static int scaffold_into(const char *project_dir, const char *project_name,
-                         char *error, size_t error_size)
+                         int refuse_existing, char *error, size_t error_size)
 {
     char manifest_path[FORGE_PATH_MAX];
     char main_path[FORGE_PATH_MAX];
@@ -106,6 +111,22 @@ static int scaffold_into(const char *project_dir, const char *project_name,
                          ".gitignore") != 0) {
         forge_util_set_error(error, error_size, "project path is too long");
         return -1;
+    }
+    if (refuse_existing) {
+        struct stat details;
+
+        if (stat(main_path, &details) == 0) {
+            forge_util_set_error(error, error_size,
+                      "'src/main.c' already exists; forge init does not overwrite "
+                      "existing files");
+            return -1;
+        }
+        if (stat(gitignore_path, &details) == 0) {
+            forge_util_set_error(error, error_size,
+                      "'.gitignore' already exists; forge init does not overwrite "
+                      "existing files");
+            return -1;
+        }
     }
     if (forge_paths_ensure_directory(src_dir, error, error_size) != 0) {
         return -1;
@@ -147,7 +168,7 @@ int forge_scaffold_new_project(const char *name, char *error, size_t error_size)
     if (forge_paths_ensure_directory(project_dir, error, error_size) != 0) {
         return -1;
     }
-    return scaffold_into(project_dir, name, error, error_size);
+    return scaffold_into(project_dir, name, 0, error, error_size);
 }
 
 int forge_scaffold_init_project(char *error, size_t error_size)
@@ -163,8 +184,21 @@ int forge_scaffold_init_project(char *error, size_t error_size)
                              "this directory already has a valid Forge.toml");
         return -1;
     }
-    /* A missing manifest is expected here; any other parse failure still just
-     * means there is no usable project yet, so scaffold over it either way. */
+    /*
+     * A missing manifest is expected here. A manifest that exists but fails
+     * to parse still blocks init: overwriting a broken-but-precious file the
+     * user meant to fix would destroy it.
+     */
+    {
+        struct stat details;
+
+        if (stat("Forge.toml", &details) == 0) {
+            forge_util_set_error(error, error_size,
+                      "'Forge.toml' exists but does not parse; fix or remove it "
+                      "before running forge init");
+            return -1;
+        }
+    }
     if (forge_paths_current_directory(current, sizeof(current)) != 0) {
         forge_util_set_error(error, error_size, "could not read the current directory");
         return -1;
@@ -179,5 +213,5 @@ int forge_scaffold_init_project(char *error, size_t error_size)
          * neutral one the user can edit in Forge.toml. */
         base = "app";
     }
-    return scaffold_into(".", base, error, error_size);
+    return scaffold_into(".", base, 1, error, error_size);
 }

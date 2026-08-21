@@ -3,6 +3,22 @@
 
 #include <stddef.h>
 
+/*
+ * Freshness checks for incremental builds. All comparisons use the full
+ * timestamp precision the platform provides (100 ns FILETIME on Windows,
+ * nanosecond stat fields where the libc exposes them), so a quick
+ * edit-then-rebuild within the same second is never missed.
+ */
+
+/* Returns 1 when `path`'s mtime is strictly newer than `reference`'s.
+ * A missing file counts as old; a missing reference yields 0. */
+int forge_fingerprint_path_is_newer(const char *path, const char *reference);
+
+/* Writes the modification time of `path` as "<seconds>.<nanoseconds>", or
+ * "missing" when the path does not exist, so callers can record and later
+ * compare exact input states (link-input stamps). Returns 0 on success. */
+int forge_fingerprint_mtime_text(const char *path, char *text, size_t text_size);
+
 #include "forge/paths.h"
 
 /*

@@ -2,6 +2,17 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include "forge/platform.h"
+
+#if !FORGE_PLATFORM_WINDOWS
+/*
+ * st_mtim (nanosecond modification times) needs POSIX.1-2008 on glibc/musl;
+ * without this the fallback would silently drop to one-second granularity
+ * and quick edit-rebuild cycles could be missed.
+ */
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <stdio.h>
 #include <string.h>
 
@@ -15,6 +26,81 @@
 #else
 #include <sys/stat.h>
 #endif
+
+/* Modification time as a comparable pair, at full platform precision. */
+typedef struct ForgeFileTime {
+    long long seconds;
+    long nanoseconds;
+} ForgeFileTime;
+
+/* -1 when `path` does not exist or cannot be stat'ed. */
+static int file_time(const char *path, ForgeFileTime *time)
+{
+#if FORGE_PLATFORM_WINDOWS
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    ULARGE_INTEGER ticks;
+
+    if (GetFileAttributesExA(path, GetFileExInfoStandard, &data) == 0) {
+        return -1;
+    }
+    ticks.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    ticks.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    /* FILETIME: 100 ns ticks since 1601; convert to seconds + nanoseconds. */
+    time->seconds = (long long)(ticks.QuadPart / 10000000ULL);
+    time->nanoseconds = (long)((ticks.QuadPart % 10000000ULL) * 100ULL);
+    return 0;
+#else
+    struct stat details;
+
+    if (stat(path, &details) != 0) {
+        return -1;
+    }
+    time->seconds = (long long)details.st_mtime;
+#if defined(__APPLE__)
+    time->nanoseconds = (long)details.st_mtimespec.tv_nsec;
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__) || \
+    defined(__DragonFly__) || defined(__OpenBSD__)
+    time->nanoseconds = (long)details.st_mtim.tv_nsec;
+#else
+    time->nanoseconds = 0L;
+#endif
+    return 0;
+#endif
+}
+
+static int time_is_newer(const ForgeFileTime *candidate, const ForgeFileTime *reference)
+{
+    if (candidate->seconds != reference->seconds) {
+        return candidate->seconds > reference->seconds;
+    }
+    return candidate->nanoseconds > reference->nanoseconds;
+}
+
+int forge_fingerprint_path_is_newer(const char *path, const char *reference)
+{
+    ForgeFileTime path_time;
+    ForgeFileTime reference_time;
+
+    if (file_time(path, &path_time) != 0 || file_time(reference, &reference_time) != 0) {
+        return 0;
+    }
+    return time_is_newer(&path_time, &reference_time);
+}
+
+int forge_fingerprint_mtime_text(const char *path, char *text, size_t text_size)
+{
+    ForgeFileTime time;
+
+    if (text == NULL || text_size == 0U) {
+        return -1;
+    }
+    if (file_time(path, &time) != 0) {
+        (void)snprintf(text, text_size, "missing");
+        return 0;
+    }
+    (void)snprintf(text, text_size, "%lld.%09ld", time.seconds, time.nanoseconds);
+    return 0;
+}
 
 /*
  * Stable FNV-1a hash of a source path. Object files are named after this hash
@@ -42,24 +128,7 @@ static unsigned int source_hash(const char *text)
  */
 static int dependency_is_stale(const char *path, const char *object_path)
 {
-#if FORGE_PLATFORM_WINDOWS
-    WIN32_FILE_ATTRIBUTE_DATA path_data;
-    WIN32_FILE_ATTRIBUTE_DATA object_data;
-
-    if (GetFileAttributesExA(path, GetFileExInfoStandard, &path_data) == 0 ||
-        GetFileAttributesExA(object_path, GetFileExInfoStandard, &object_data) == 0) {
-        return 1;
-    }
-    return CompareFileTime(&path_data.ftLastWriteTime, &object_data.ftLastWriteTime) > 0;
-#else
-    struct stat path_stat;
-    struct stat object_stat;
-
-    if (stat(path, &path_stat) != 0 || stat(object_path, &object_stat) != 0) {
-        return 1;
-    }
-    return path_stat.st_mtime > object_stat.st_mtime;
-#endif
+    return forge_fingerprint_path_is_newer(path, object_path);
 }
 
 /*
@@ -173,30 +242,19 @@ int forge_fingerprint_object_fresh(const char *object_path, const char *source_p
 {
     char depfile_path[FORGE_PATH_MAX];
     FILE *stream;
+    ForgeFileTime object_time;
+    ForgeFileTime source_time;
     int fresh;
 
-#if FORGE_PLATFORM_WINDOWS
-    WIN32_FILE_ATTRIBUTE_DATA object_data;
-    WIN32_FILE_ATTRIBUTE_DATA source_data;
-
-    if (GetFileAttributesExA(object_path, GetFileExInfoStandard, &object_data) == 0 ||
-        GetFileAttributesExA(source_path, GetFileExInfoStandard, &source_data) == 0) {
+    if (file_time(object_path, &object_time) != 0 ||
+        file_time(source_path, &source_time) != 0) {
         return 0;
     }
-    if (CompareFileTime(&object_data.ftLastWriteTime, &source_data.ftLastWriteTime) < 0) {
+    /* Equal timestamps count as fresh: an object written in the same tick as
+     * its source was built from that source. */
+    if (time_is_newer(&source_time, &object_time)) {
         return 0;
     }
-#else
-    struct stat object_stat;
-    struct stat source_stat;
-
-    if (stat(object_path, &object_stat) != 0 || stat(source_path, &source_stat) != 0) {
-        return 0;
-    }
-    if (object_stat.st_mtime < source_stat.st_mtime) {
-        return 0;
-    }
-#endif
     if (!track_headers) {
         return 1;
     }

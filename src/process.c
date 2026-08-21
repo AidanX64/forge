@@ -114,15 +114,19 @@ static char *build_command_line(char *const *argv, char *error, size_t error_siz
 {
     size_t index;
     size_t length = 0U;
-    size_t capacity = 128U + strlen(argv[0]);
+    size_t capacity = 128U + strlen(argv[0]) * 2U;
     char *line;
     int written;
 
+    /* Quoting can more than double an argument: every backslash before a
+     * quote is doubled and quotes gain a backslash each, so budget 2x plus
+     * slack instead of the naive strlen + 1 that made long path-heavy
+     * commands fail spuriously with "command line is too long". */
     for (index = 1; index < (size_t)-1; ++index) {
         if (argv[index] == NULL) {
             break;
         }
-        capacity += strlen(argv[index]) + 4U;
+        capacity += strlen(argv[index]) * 2U + 4U;
     }
     line = malloc(capacity);
     if (line == NULL) {
@@ -137,8 +141,15 @@ static char *build_command_line(char *const *argv, char *error, size_t error_siz
             break;
         }
         if (index != 0U) {
+            /* The capacity above is budgeted for every argument, so hitting
+             * this means the math was wrong: fail loudly rather than hand
+             * the child a silently truncated command line. */
             if (length + 1U >= capacity) {
-                break;
+                if (error != NULL && error_size != 0U) {
+                    (void)snprintf(error, error_size, "command line is too long");
+                }
+                free(line);
+                return NULL;
             }
             line[length++] = ' ';
             line[length] = '\0';

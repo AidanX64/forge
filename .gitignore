@@ -11,3 +11,6 @@
 
 # Example scaffolding (kept out of the repo on purpose)
 /examples/
+
+# Local agent test scratch (not committed)
+/.scratch/

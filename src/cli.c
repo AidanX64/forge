@@ -17,10 +17,14 @@ static void print_usage(FILE *stream)
             "  forge build [--release] [--jobs N] [--manifest PATH]\n"
             "  forge check [--release] [--jobs N] [--manifest PATH]\n"
             "  forge run [--release] [--jobs N] [--manifest PATH] [-- ARGS...]\n"
-            "  forge test [--release] [--jobs N] [--manifest PATH]\n"
+            "  forge test [--release] [--jobs N] [--test NAME] [--manifest PATH]\n"
             "  forge debug [--release] [--jobs N] [--manifest PATH]\n"
             "  forge clean [--manifest PATH]\n"
-            "  forge update [--manifest PATH]   re-resolve dependencies\n"
+            "  forge update [NAME] [--manifest PATH]\n"
+            "                        re-resolve deps (one, or all when NAME is omitted)\n"
+            "  forge add <NAME> --git URL [--tag T | --branch B | --rev R]\n"
+            "  forge add <NAME> --path DIR      [--manifest PATH]\n"
+            "  forge remove <NAME> [--manifest PATH]\n"
             "  forge new <NAME>      scaffold a new project directory\n"
             "  forge init            scaffold into the current directory\n");
 }
@@ -85,7 +89,7 @@ static int command_init(int argc, char **argv)
     return forge_orchestrate_init();
 }
 
-/* Shared parser for the manifest-only commands (clean/update). */
+/* Shared parser for the manifest-only command (clean). */
 static int command_manifest_only(const char *command, int argc, char **argv,
                                  int (*dispatch)(const char *))
 {
@@ -108,12 +112,14 @@ static int command_manifest_only(const char *command, int argc, char **argv,
 }
 
 /* Shared parser for build/check/run/test/debug: profile and job flags plus
- * --manifest; run additionally accepts "-- ARGS..." for the program itself. */
+ * --manifest; run additionally accepts "-- ARGS..." for the program itself
+ * and test accepts --test NAME to run a single test. */
 static int command_build_like(const char *command, int argc, char **argv)
 {
     const char *manifest_path = "Forge.toml";
     const char *program_arguments[FORGE_MAX_PROGRAM_ARGUMENTS];
     char discovered[FORGE_PATH_MAX];
+    const char *test_filter = NULL;
     size_t program_argument_count = 0U;
     int accepts_program_arguments = strcmp(command, "run") == 0;
     int explicit_manifest = 0;
@@ -135,6 +141,9 @@ static int command_build_like(const char *command, int argc, char **argv)
         }
         if (strcmp(argv[index], "--release") == 0) {
             release = 1;
+        } else if (strcmp(argv[index], "--test") == 0 && index + 1 < argc &&
+                   strcmp(command, "test") == 0) {
+            test_filter = argv[++index];
         } else if (strcmp(argv[index], "--manifest") == 0 && index + 1 < argc) {
             manifest_path = argv[++index];
             explicit_manifest = 1;
@@ -160,13 +169,117 @@ static int command_build_like(const char *command, int argc, char **argv)
         return forge_orchestrate_check(manifest_path, release, max_jobs);
     }
     if (strcmp(command, "test") == 0) {
-        return forge_orchestrate_test(manifest_path, release, max_jobs);
+        return forge_orchestrate_test(manifest_path, release, max_jobs, test_filter);
     }
     if (strcmp(command, "debug") == 0) {
         return forge_orchestrate_debug(manifest_path, release, max_jobs);
     }
     return forge_orchestrate_run(manifest_path, release, max_jobs,
                                  program_arguments, program_argument_count);
+}
+
+/* forge add NAME (--git URL | --path DIR) [--tag T|--branch B|--rev R]
+ * [--manifest PATH]. Exactly one source; at most one ref, git-only. */
+static int command_add(int argc, char **argv)
+{
+    const char *manifest_path = "Forge.toml";
+    const char *name = NULL;
+    const char *git_url = NULL;
+    const char *dep_path = NULL;
+    const char *ref_kind = "";
+    const char *ref_value = "";
+    char discovered[FORGE_PATH_MAX];
+    int explicit_manifest = 0;
+    int index;
+
+    if (argc < 3 || argv[2][0] == '-') {
+        fprintf(stderr,
+                "forge: 'add' requires a dependency name, e.g. "
+                "forge add mylib --git https://example.com/mylib\n");
+        return 1;
+    }
+    name = argv[2];
+    for (index = 3; index < argc; ++index) {
+        if (strcmp(argv[index], "--git") == 0 && index + 1 < argc) {
+            git_url = argv[++index];
+        } else if (strcmp(argv[index], "--path") == 0 && index + 1 < argc) {
+            dep_path = argv[++index];
+        } else if ((strcmp(argv[index], "--tag") == 0 ||
+                    strcmp(argv[index], "--branch") == 0 ||
+                    strcmp(argv[index], "--rev") == 0) && index + 1 < argc) {
+            if (ref_value[0] != '\0') {
+                fprintf(stderr, "forge: 'add' accepts only one of "
+                                "--tag/--branch/--rev\n");
+                return 1;
+            }
+            ref_kind = strcmp(argv[index], "--tag") == 0 ? "tag" :
+                       strcmp(argv[index], "--branch") == 0 ? "branch" : "rev";
+            ref_value = argv[++index];
+        } else if (strcmp(argv[index], "--manifest") == 0 && index + 1 < argc) {
+            manifest_path = argv[++index];
+            explicit_manifest = 1;
+        } else {
+            fprintf(stderr, "forge: unsupported add option '%s'\n", argv[index]);
+            return 1;
+        }
+    }
+    discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
+    return forge_orchestrate_add(manifest_path, name, git_url != NULL ? git_url : "",
+                                 ref_kind, ref_value, dep_path != NULL ? dep_path : "");
+}
+
+static int command_remove(int argc, char **argv)
+{
+    const char *manifest_path = "Forge.toml";
+    char discovered[FORGE_PATH_MAX];
+    int explicit_manifest = 0;
+    int index;
+
+    if (argc < 3 || argv[2][0] == '-') {
+        fprintf(stderr, "forge: 'remove' requires a dependency name\n");
+        return 1;
+    }
+    for (index = 3; index < argc; ++index) {
+        if (strcmp(argv[index], "--manifest") == 0 && index + 1 < argc) {
+            manifest_path = argv[++index];
+            explicit_manifest = 1;
+        } else {
+            fprintf(stderr, "forge: unsupported remove option '%s'\n", argv[index]);
+            return 1;
+        }
+    }
+    discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
+    return forge_orchestrate_remove(manifest_path, argv[2]);
+}
+
+/* forge update [NAME] [--manifest PATH]: without NAME every dependency
+ * re-resolves to the newest allowed state; with NAME only that dependency is
+ * pulled past its lock pin and the rest stay quiet and offline-friendly. */
+static int command_update(int argc, char **argv)
+{
+    const char *manifest_path = "Forge.toml";
+    const char *only_name = NULL;
+    char discovered[FORGE_PATH_MAX];
+    int explicit_manifest = 0;
+    int index;
+
+    for (index = 2; index < argc; ++index) {
+        if (strcmp(argv[index], "--manifest") == 0 && index + 1 < argc) {
+            manifest_path = argv[++index];
+            explicit_manifest = 1;
+        } else if (argv[index][0] != '-' && only_name == NULL) {
+            only_name = argv[index];
+        } else if (argv[index][0] != '-') {
+            fprintf(stderr, "forge: 'update' accepts at most one dependency "
+                            "name\n");
+            return 1;
+        } else {
+            fprintf(stderr, "forge: unsupported update option '%s'\n", argv[index]);
+            return 1;
+        }
+    }
+    discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
+    return forge_orchestrate_update(manifest_path, only_name);
 }
 
 int forge_cli_main(int argc, char **argv)
@@ -186,7 +299,8 @@ int forge_cli_main(int argc, char **argv)
     if (strcmp(command, "build") != 0 && strcmp(command, "check") != 0 &&
         strcmp(command, "run") != 0 && strcmp(command, "test") != 0 &&
         strcmp(command, "debug") != 0 && strcmp(command, "clean") != 0 &&
-        strcmp(command, "update") != 0 &&
+        strcmp(command, "update") != 0 && strcmp(command, "add") != 0 &&
+        strcmp(command, "remove") != 0 &&
         strcmp(command, "new") != 0 && strcmp(command, "init") != 0) {
         fprintf(stderr, "forge: unsupported command '%s'\n", argv[1]);
         print_usage(stderr);
@@ -202,7 +316,13 @@ int forge_cli_main(int argc, char **argv)
         return command_manifest_only(command, argc, argv, forge_orchestrate_clean);
     }
     if (strcmp(command, "update") == 0) {
-        return command_manifest_only(command, argc, argv, forge_orchestrate_update);
+        return command_update(argc, argv);
+    }
+    if (strcmp(command, "add") == 0) {
+        return command_add(argc, argv);
+    }
+    if (strcmp(command, "remove") == 0) {
+        return command_remove(argc, argv);
     }
     return command_build_like(command, argc, argv);
 }

@@ -114,6 +114,23 @@ static int directory_exists(const char *path)
     return stat(path, &details) == 0 && S_ISDIR(details.st_mode);
 }
 
+/* True when anything (file or directory) exists at `path`. */
+static int path_exists(const char *path)
+{
+    struct stat details;
+
+    return stat(path, &details) == 0;
+}
+
+/* Joins dir + name and reports whether the result exists at all. */
+static int dir_has_entry(const char *dir, const char *name)
+{
+    char path[FORGE_PATH_MAX];
+
+    return forge_paths_join(path, sizeof(path), dir, name) == 0 &&
+           path_exists(path);
+}
+
 /* Joins dir + name and reports whether the result is a regular file. */
 static int dir_has_file(const char *dir, const char *name)
 {
@@ -217,6 +234,14 @@ static int read_first_line(const char *path, char *output, size_t output_size)
     return 0;
 }
 
+/* Removes the cached clone at `cache_dir` best-effort so a fresh clone can
+ * replace it. Used when the directory exists but is not a usable repository
+ * (e.g. an interrupted clone left a partial checkout behind). */
+static void discard_cache_dir(const char *cache_dir)
+{
+    forge_paths_remove_tree(cache_dir, NULL, 0U);
+}
+
 /*
  * Makes sure `cache_dir` holds a clone of `url` with `target` (a ref, or a
  * locked commit SHA) checked out, and reports the resolved commit SHA.
@@ -236,28 +261,65 @@ static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char
     char *revparse_arguments[] = { "rev-parse", "HEAD", NULL };
     char target[FORGE_DEPS_VALUE_MAX];
     int use_locked = locked_commit[0] != '\0' && !force_update;
+    int needs_checkout = 1;
 
+    /*
+     * A directory without a .git entry is not a usable clone (an interrupted
+     * clone can leave one behind); wipe it so the clone below starts clean
+     * instead of failing forever with "not a git repository". Both layouts
+     * are accepted: normal clones have a .git directory, worktrees a file.
+     */
+    if (directory_exists(cache_dir) && !dir_has_entry(cache_dir, ".git")) {
+        deps_log(logger, "deps", "dependency cache for %s is incomplete; re-cloning",
+                 name);
+        discard_cache_dir(cache_dir);
+    }
     if (!directory_exists(cache_dir)) {
         deps_log(logger, "deps", "cloning %s (%s)", name, url);
         if (git_run(logger, NULL, clone_arguments, NULL, 0, error, error_size) != 0) {
+            /* A failed clone often leaves a partial directory; clear it so the
+             * next attempt starts from scratch instead of seeing a broken repo. */
+            discard_cache_dir(cache_dir);
             return -1;
         }
+        /*
+         * The fresh clone already sits on the remote's default-branch tip,
+         * so there is nothing to check out — and no FETCH_HEAD either (that
+         * file only exists once a fetch ran), making any checkout here fail
+         * with "does not take a path argument".
+         */
+        needs_checkout = 0;
     } else if (!use_locked) {
         if (git_run(logger, cache_dir, fetch_arguments, NULL, 0, error, error_size) != 0) {
             return -1;
         }
     }
-    if (use_locked) {
-        (void)snprintf(target, sizeof(target), "%s", locked_commit);
-    } else if (ref[0] != '\0') {
-        (void)snprintf(target, sizeof(target), "%s", ref);
-    } else {
-        /* No ref pinned: track the remote's default branch tip. */
-        (void)snprintf(target, sizeof(target), "FETCH_HEAD");
-    }
-    checkout_arguments[3] = target;
-    if (git_run(logger, cache_dir, checkout_arguments, NULL, 0, error, error_size) != 0) {
-        return -1;
+    if (needs_checkout) {
+        if (use_locked) {
+            (void)snprintf(target, sizeof(target), "%s", locked_commit);
+        } else if (ref[0] != '\0') {
+            (void)snprintf(target, sizeof(target), "%s", ref);
+        } else {
+            /* No ref pinned: track the remote's default branch tip. */
+            (void)snprintf(target, sizeof(target), "FETCH_HEAD");
+        }
+        checkout_arguments[3] = target;
+        if (git_run(logger, cache_dir, checkout_arguments, NULL, 0, error,
+                    error_size) != 0) {
+            /*
+             * The locked commit may simply not exist in this local clone yet
+             * (the cache was cloned while a different ref was checked out).
+             * Fetch once and retry before giving up so offline-capable
+             * rebuilds still recover online.
+             */
+            if (!use_locked ||
+                git_run(logger, cache_dir, fetch_arguments, NULL, 0, error,
+                        error_size) != 0 ||
+                git_run(logger, cache_dir, checkout_arguments, NULL, 0, error,
+                        error_size) != 0) {
+                return -1;
+            }
+        }
     }
     if (snprintf(capture, sizeof(capture), "%s/revparse.tmp", cache_dir) < 0 ||
         strlen(cache_dir) + 14U >= sizeof(capture)) {
@@ -440,6 +502,9 @@ typedef struct ForgeResolveContext {
     ForgeLockFile lock;
     int lock_dirty;
     int force_update;
+    /* When non-empty, only this dependency is re-resolved past its lock pin
+     * (`forge update <name>`); every other dep keeps its locked commit. */
+    char force_update_name[FORGE_MANIFEST_VALUE_MAX];
     ForgeDepGraph *graph;
     ForgeLogger *logger;
     char error[FORGE_COMMAND_MAX];
@@ -449,6 +514,9 @@ static ForgeDepNode *graph_find_node(ForgeDepGraph *graph, const char *name)
 {
     size_t index;
 
+    if (graph == NULL) {
+        return NULL;
+    }
     for (index = 0U; index < graph->count; ++index) {
         if (strcmp(graph->nodes[index].name, name) == 0) {
             return &graph->nodes[index];
@@ -474,6 +542,7 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
         ForgeDepNode *node;
         ForgeManifest *parsed = NULL;
         int is_native;
+        int dep_force;
         size_t stack_index;
 
         /* Cycle check along the current path. */
@@ -494,6 +563,12 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                       "more than %u dependencies", FORGE_DEPS_MAX_NODES);
             return -1;
         }
+
+        /* Global --force wins; otherwise only the dependency named by
+         * `forge update <name>` is pulled past its lock pin. */
+        dep_force = context->force_update ||
+                    (context->force_update_name[0] != '\0' &&
+                     strcmp(context->force_update_name, dependency->name) == 0);
 
         if (dependency->path[0] != '\0') {
             if (forge_paths_join(root, sizeof(root), consumer_root,
@@ -533,7 +608,7 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                     strcmp(locked->url, dependency->git_url) == 0 &&
                                     strcmp(locked->ref, dependency->ref) == 0 ?
                                         locked->commit : "",
-                                    context->force_update, cache_dir,
+                                    dep_force, cache_dir,
                                     resolved_sha, sizeof(resolved_sha),
                                     context->error, sizeof(context->error)) != 0) {
                 return -1;
@@ -602,25 +677,52 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
     return 0;
 }
 
+/*
+ * Drops lock entries for dependencies that are no longer reachable from the
+ * manifest (removed directly, or via a transitive consumer), so Forge.lock
+ * always mirrors the graph that was just resolved.
+ */
+static void prune_lock_entries(ForgeLockFile *lock, const ForgeDepGraph *graph,
+                               int *dirty)
+{
+    size_t index;
+    size_t kept = 0U;
+
+    for (index = 0U; index < lock->count; ++index) {
+        if (graph_find_node((ForgeDepGraph *)graph, lock->items[index].name) == NULL) {
+            *dirty = 1;
+            continue;
+        }
+        if (kept != index) {
+            lock->items[kept] = lock->items[index];
+        }
+        ++kept;
+    }
+    lock->count = kept;
+}
+
 int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
-                       int force_update, ForgeDepGraph *graph, ForgeLogger *logger,
+                       int force_update, const char *force_update_name,
+                       ForgeDepGraph *graph, ForgeLogger *logger,
                        char *error, size_t error_size)
 {
     ForgeResolveContext context;
     char names[FORGE_DEPS_MAX_DEPTH][FORGE_MANIFEST_VALUE_MAX];
     int status;
+    int dirty;
 
     if (project_root == NULL || manifest == NULL || graph == NULL) {
         forge_util_set_error(error, error_size, "project root, manifest, and graph are required");
         return -1;
     }
     memset(graph, 0, sizeof(*graph));
-    if (manifest->dependencies.count == 0U) {
-        return 0;
-    }
     memset(&context, 0, sizeof(context));
     context.project_root = project_root;
     context.force_update = force_update;
+    if (force_update_name != NULL) {
+        (void)snprintf(context.force_update_name,
+                       sizeof(context.force_update_name), "%s", force_update_name);
+    }
     context.graph = graph;
     context.logger = logger;
     if (forge_paths_join(context.lock_path, sizeof(context.lock_path), project_root,
@@ -631,8 +733,26 @@ int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
     if (load_lockfile(context.lock_path, &context.lock, error, error_size) != 0) {
         return -1;
     }
+    /*
+     * No [dependencies] at all is still meaningful: every previously locked
+     * dependency is now unreachable and must leave the lockfile.
+     */
+    if (manifest->dependencies.count == 0U) {
+        if (context.lock.count != 0U) {
+            context.lock.count = 0U;
+            if (save_lockfile(context.lock_path, &context.lock, error, error_size) != 0) {
+                return -1;
+            }
+        }
+        return 0;
+    }
     status = resolve_recursive(&context, project_root, manifest, 0, names);
-    if (status == 0 && (context.lock_dirty || !context.lock.exists)) {
+    if (status == 0) {
+        prune_lock_entries(&context.lock, graph, &dirty);
+    } else {
+        dirty = 0;
+    }
+    if (status == 0 && (context.lock_dirty || dirty || !context.lock.exists)) {
         if (save_lockfile(context.lock_path, &context.lock, error, error_size) != 0) {
             status = -1;
         }

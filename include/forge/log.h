@@ -19,12 +19,7 @@ typedef struct ForgeLogger {
 int forge_logger_init_in(ForgeLogger *logger, const char *project_root,
                          const char *kind, char *error, size_t error_size);
 
-/* Creates target/logs/<kind>-<timestamp>.log relative to the working directory. */
-int forge_logger_init(ForgeLogger *logger, const char *kind,
-                      char *error, size_t error_size);
 void forge_logger_close(ForgeLogger *logger);
-int forge_logger_suspend(ForgeLogger *logger, char *error, size_t error_size);
-int forge_logger_resume(ForgeLogger *logger, char *error, size_t error_size);
 void forge_logger_log(ForgeLogger *logger, const char *stage,
                       const char *format, ...);
 void forge_logger_error(ForgeLogger *logger, const char *stage,

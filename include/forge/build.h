@@ -28,8 +28,11 @@ int forge_build_project_root(const char *manifest_path, char *root, size_t root_
  * receives the spawned program's exit code; the function's own return value
  * stays 0/-1 for "the build pipeline worked / failed", so callers decide
  * whether a nonzero child code becomes their exit status.
+ * `manifest_path` anchors link-level freshness (the executable is not
+ * relinked while its recorded inputs are unchanged); pass NULL to opt out.
  */
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
+                        const char *manifest_path,
                         ForgeBuildMode mode, int release, int max_jobs,
                         const char *const *program_arguments,
                         size_t program_argument_count,
@@ -39,10 +42,12 @@ int forge_build_clean(const char *manifest_path);
 
 /*
  * Builds and runs every standalone test source in <root>/tests (each test
- * file is its own binary with its own main). Returns 0 when all passed,
+ * file is its own binary with its own main). When `test_filter` is non-NULL
+ * only the test whose binary name equals it runs. Returns 0 when all passed,
  * 1 when any failed.
  */
 int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
-                      int release, int max_jobs);
+                      const char *manifest_path,
+                      int release, int max_jobs, const char *test_filter);
 
 #endif

@@ -84,7 +84,7 @@ static int append_std_msvc(ForgeArgv *argv, const char *std_version,
         if (error != NULL && error_size != 0U) {
             (void)snprintf(error, error_size,
                            "standard '%s' is not supported by MSVC; "
-                           "choose c11, c17, c++17, c++20, or c++23",
+                           "choose c11, c17, c++14, c++17, c++20, or c++23",
                            std_version);
         }
         return -1;
@@ -93,7 +93,8 @@ static int append_std_msvc(ForgeArgv *argv, const char *std_version,
 }
 
 /* Translates one GCC/Clang-dialect cflag for the MSVC toolchain.
- * Returns 1 (appended), 0 (deliberately dropped), or -1 (rejected). */
+ * Returns 0 when the flag was translated or deliberately dropped, and
+ * -1 when it has no MSVC equivalent (rejected with a diagnostic). */
 static int translate_cflag_msvc(ForgeArgv *argv, const char *flag,
                                 char *error, size_t error_size)
 {
@@ -174,21 +175,48 @@ int forge_flags_append(ForgeArgv *argv, const ForgeCompiler *compiler,
                                   sizeof(profile->std_version)) != 0) {
             return -1;
         }
-    }
-    if (profile->warnings_as_errors) {
-        if (forge_argv_append(argv, is_msvc(compiler) ? "/WX" : "-Werror") != 0) {
-            return -1;
-        }
-    }
-    for (index = 0U; index < profile->cflags.count; ++index) {
-        const char *flag = profile->cflags.items[index];
-
+        /* Warning and raw-flag options are compile-stage only for MSVC: the
+         * cl-driven link step rejects /W* and friends with LNK4044 noise.
+         * GCC/Clang drivers accept them at link time, so their cflags stay
+         * on both stages (that is how -lm-style flags reach the linker). */
         if (compiler->kind == FORGE_COMPILER_MSVC) {
-            int translated = translate_cflag_msvc(argv, flag, error, error_size);
-            if (translated < 0) {
+            for (index = 0U; index < profile->cflags.count; ++index) {
+                int translated = translate_cflag_msvc(argv, profile->cflags.items[index],
+                                                      error, error_size);
+
+                if (translated < 0) {
+                    return -1;
+                }
+            }
+            if (profile->warnings_as_errors &&
+                forge_argv_append(argv, "/WX") != 0) {
                 return -1;
             }
-        } else if (forge_argv_append(argv, flag) != 0) {
+        } else {
+            if (profile->warnings_as_errors && forge_argv_append(argv, "-Werror") != 0) {
+                return -1;
+            }
+            for (index = 0U; index < profile->cflags.count; ++index) {
+                if (forge_argv_append(argv, profile->cflags.items[index]) != 0) {
+                    return -1;
+                }
+            }
+        }
+        return 0;
+    }
+
+    /* Link stage beyond the /O* //DEBUG pair handled above:
+     * - MSVC gets nothing else (everything left is invalid to link.exe);
+     * - GCC/Clang get the portable warning flag plus raw cflags so link-time
+     *   options like library names still apply. */
+    if (compiler->kind == FORGE_COMPILER_MSVC) {
+        return 0;
+    }
+    if (profile->warnings_as_errors && forge_argv_append(argv, "-Werror") != 0) {
+        return -1;
+    }
+    for (index = 0U; index < profile->cflags.count; ++index) {
+        if (forge_argv_append(argv, profile->cflags.items[index]) != 0) {
             return -1;
         }
     }

@@ -16,6 +16,13 @@ int forge_paths_join(char *destination, size_t destination_size,
 int forge_paths_resolve(const char *root, const char *relative,
                         char *destination, size_t destination_size);
 
+/* Turns `path` into a fully normalized absolute path (resolving ".", "..",
+ * and separator style). Paths that cannot be resolved (e.g. they do not
+ * exist yet, on POSIX) fall back to their raw text. Returns 0 unless the
+ * result would not fit. */
+int forge_paths_absolute(const char *path, char *destination,
+                         size_t destination_size);
+
 /* Creates `path` and all missing parents (like mkdir -p). Returns 0 on
  * success, -1 with a message in `error` otherwise. */
 int forge_paths_ensure_directory(const char *path, char *error, size_t error_size);

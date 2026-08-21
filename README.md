@@ -38,6 +38,8 @@ of raw C.)
   output layout, and build execution (compiles run on a thread pool).
 - `src/deps.c` resolves `[dependencies]`: git/path fetching, the shared cache,
   `Forge.lock` pinning, graph resolution, and foreign CMake/Make builds.
+- `src/pkg.c` implements the manifest-editing dependency verbs
+  (`forge add` / `forge remove`).
 - `src/manifest.c`, `src/compiler.c`, `src/flags.c`, `src/log.c`, and
   `src/debug.c` provide the focused subsystems used by the build engine.
 - `src/scaffold.c` generates new project skeletons for `forge new` / `forge init`.
@@ -134,8 +136,14 @@ forge run -- --verbose   # arguments after -- go to your program
 forge run -j 8           # compile up to 8 translation units in parallel
 forge check              # fast compile-only validation, no link
 forge test               # build & run every tests/*.c as its own binary
+forge test --test alpha  # build & run only tests/alpha.c
 forge debug              # build, then launch a debugger
 forge clean              # remove the project's target/ output
+forge add mylib --git https://github.com/example/mylib
+                         # add a dependency, resolve it, and pin it
+forge add local --path ../local
+forge update mylib       # re-resolve one dep; `forge update` does all of them
+forge remove mylib       # drop the entry and its lock pin
 forge run --manifest path/to/Forge.toml
                          # build another project without cd-ing into it
 ```
@@ -180,15 +188,24 @@ or metacharacters are passed literally. Commands that would exceed the OS
 command-line limit spill the object list and flags into a compiler response
 file (`@target/<profile>/link.rsp`) automatically.
 
+Linking is incremental too: after a successful link, Forge records the exact
+input list (objects, libraries, manifest) with each input's precise mtime in
+a `<target>/<profile>/<exe>.linkstamp`. When nothing on that list changed,
+the next build skips the link entirely (`up-to-date: <exe>`), so a rerun of
+an already-built project is fully quiet — no compiles, no link.
+
 ### Fast validation and tests
 
 `forge check` compiles every translation unit without linking — a quick
 way to catch errors while editing, with incremental skips on repeat runs.
 
-`forge test` builds each `tests/*.c` file as its own self-contained binary
-(each file has its own `main`), runs them all, prints a
+`forge test` builds each file in `tests/` as its own self-contained binary
+(each file has its own `main`; C, C++, and assembly sources are all
+collected), runs them all, prints a
 `test result: N passed; M failed` summary, and exits nonzero when any fail.
-A missing or empty `tests/` directory is not an error.
+A missing or empty `tests/` directory is not an error. Pass `--test NAME`
+to build and run a single test (e.g. `forge test --test parser`) instead of
+the whole suite; a filter that matches no test is an error.
 
 ### Dependencies
 
@@ -215,6 +232,30 @@ coolib    = { git = "https://github.com/example/coolib", tag = "v1.2" }   # bran
 - Include directories (`<dep>/include`, else the dep root) feed every compile;
   the dep's objects/static library (`.a`/`.lib`) feed the link line.
   Dynamic libraries are out of scope for now.
+
+Dependencies can be managed without hand-editing the manifest, Cargo-style:
+
+```sh
+forge add mylib --git https://github.com/example/mylib --tag v1.2
+forge add utils --path ../utils      # path deps are used in place, never cached
+forge update mylib                   # pull just this dep to its newest allowed state
+forge remove mylib                   # drop the entry and prune its lock pin
+```
+
+`add` inserts the `[dependencies]` entry while preserving every other byte of
+the manifest (including comments and formatting), resolves the dependency
+immediately so `Forge.lock` gains its pin, and rolls the edit back if
+resolution fails (a bad URL or missing path never leaves a half-added dep).
+Exactly one source (`--git` / `--path`) is accepted; git sources may pin at
+most one ref (`--tag`, `--branch`, or `--rev`). `remove` errors on unknown
+names, listing the dependencies that do exist.
+
+Lock hygiene is automatic: entries for dependencies that disappear from the
+manifest (directly removed, or dropped by a transitive consumer) are pruned
+from `Forge.lock`, and clearing `[dependencies]` clears the lockfile.
+`forge update` re-resolves every ref; `forge update NAME` re-resolves only
+that dependency and leaves every other lock pin (and your offline rebuilds)
+untouched.
 
 ### Cross-platform compiler dispatch
 Forge detects the host OS and version at build time and automatically
@@ -292,11 +333,13 @@ not just machine-parsed.
 
 v1 build orchestration is implemented and working: `forge build`, `forge
 check`, `forge run` (with `--` argument passthrough and exit-code
-propagation), `forge test`, `forge debug`, `forge clean`, `forge update`,
-`forge new`, and `forge init` cover the host build loop. Path and git
-dependencies with lockfile pinning, plus foreign CMake/Make dependencies,
-are in place. Compiler dispatch, manifest parsing, upward manifest
-discovery, and per-invocation `target/logs` are in place.
+propagation), `forge test` (with a `--test NAME` filter), `forge debug`,
+`forge clean`, `forge update`, `forge new`, and `forge init` cover the host
+build loop. Path and git dependencies with lockfile pinning, Cargo-style
+`forge add`/`forge remove` verbs, lock pruning, and foreign CMake/Make
+dependencies are in place. Compiles and the final link are both incremental.
+Compiler dispatch, manifest parsing, upward manifest discovery, and
+per-invocation `target/logs` are in place.
 
 ## Author note 
 

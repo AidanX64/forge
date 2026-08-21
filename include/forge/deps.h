@@ -37,10 +37,13 @@ typedef struct ForgeDepGraph {
  * the shared cache (~/.forge/git), checks out locked commits, records them in
  * <project_root>/Forge.lock, parses each dependency's own manifest, and
  * rejects dependency cycles. `force_update` re-resolves refs even when the
- * lockfile already matches. Returns 0 on success.
+ * lockfile already matches; when it is zero, `force_update_name` (NULL or
+ * empty for "none") limits that re-resolution to the one named dependency,
+ * leaving every other lock pin untouched. Returns 0 on success.
  */
 int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
-                       int force_update, ForgeDepGraph *graph, ForgeLogger *logger,
+                       int force_update, const char *force_update_name,
+                       ForgeDepGraph *graph, ForgeLogger *logger,
                        char *error, size_t error_size);
 
 /* Releases the per-node manifests owned by the graph. */

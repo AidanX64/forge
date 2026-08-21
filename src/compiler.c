@@ -249,16 +249,34 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
     return -1;
 }
 
-static const char *cpp_driver(const ForgeCompiler *compiler)
+/*
+ * Picks the driver that links C++ correctly: the plain gcc/clang drivers do
+ * not pull in the C++ standard library, only their g++/clang++ counterparts
+ * do. Versioned programs map along ("gcc-13" -> "g++-13", written into
+ * `buffer`); anything already carrying "++", or unrecognizable, is passed
+ * through unchanged.
+ */
+static const char *cpp_driver(const ForgeCompiler *compiler,
+                              char *buffer, size_t buffer_size)
 {
-    if (compiler->kind == FORGE_COMPILER_GCC && strcmp(compiler->program, "gcc") == 0) {
-        return "g++";
+    const char *program = compiler->program;
+    const char *prefix = NULL;
+    const char *rest = NULL;
+
+    if (strstr(program, "++") == NULL) {
+        if (strncmp(program, "gcc", 3U) == 0) {
+            prefix = "g++";
+            rest = program + 3U;
+        } else if (strncmp(program, "clang", 5U) == 0) {
+            prefix = "clang++";
+            rest = program + 5U;
+        }
     }
-    if (compiler->kind == FORGE_COMPILER_CLANG &&
-        strcmp(compiler->program, "clang") == 0) {
-        return "clang++";
+    if (prefix == NULL) {
+        return program;
     }
-    return compiler->program;
+    (void)snprintf(buffer, buffer_size, "%s%s", prefix, rest);
+    return buffer;
 }
 
 int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
@@ -327,6 +345,7 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      char *error, size_t error_size)
 {
     const char *program;
+    char cpp_program[FORGE_COMPILER_VALUE_MAX];
     char depfile_path[FORGE_PATH_MAX_LOCAL];
 
     if (compiler == NULL || source_path == NULL || object_path == NULL ||
@@ -409,7 +428,9 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
          * the object; Forge reads it back so a header edit recompiles only
          * the files that use it.
          */
-        program = language == FORGE_SOURCE_CPP ? cpp_driver(compiler) : compiler->program;
+        program = language == FORGE_SOURCE_CPP
+                      ? cpp_driver(compiler, cpp_program, sizeof(cpp_program))
+                      : compiler->program;
         if (forge_compiler_depfile_path(object_path, depfile_path,
                                         sizeof(depfile_path)) != 0) {
             forge_util_set_error(error, error_size, "dependency file path is too long");
@@ -492,6 +513,7 @@ int forge_compiler_make_link_argv(const ForgeCompiler *compiler,
                                   char *error, size_t error_size)
 {
     const char *program;
+    char cpp_program[FORGE_COMPILER_VALUE_MAX];
     size_t index;
     ForgeArgv response = {0};
     char response_path[FORGE_PATH_MAX_LOCAL];
@@ -508,7 +530,8 @@ int forge_compiler_make_link_argv(const ForgeCompiler *compiler,
     }
     *used_response_file = 0;
 
-    program = has_cpp_source ? cpp_driver(compiler) : compiler->program;
+    program = has_cpp_source ? cpp_driver(compiler, cpp_program, sizeof(cpp_program))
+                             : compiler->program;
     if (compiler->kind == FORGE_COMPILER_MSVC) {
         program = compiler->program;
         if (forge_argv_append(argv, program) != 0 ||

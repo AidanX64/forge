@@ -48,16 +48,14 @@ static int create_log_directory(const char *root, char *error, size_t error_size
 {
     char path[FORGE_LOG_PATH_MAX];
 
-    if (snprintf(path, sizeof(path), "%s/target", root) < 0 ||
-        (size_t)snprintf(path, sizeof(path), "%s/target", root) >= sizeof(path)) {
+    if ((size_t)snprintf(path, sizeof(path), "%s/target", root) >= sizeof(path)) {
         forge_util_set_error(error, error_size, "project root path is too long");
         return -1;
     }
     if (create_directory(path, error, error_size) != 0) {
         return -1;
     }
-    if (snprintf(path, sizeof(path), "%s/target/logs", root) < 0 ||
-        (size_t)snprintf(path, sizeof(path), "%s/target/logs", root) >= sizeof(path)) {
+    if ((size_t)snprintf(path, sizeof(path), "%s/target/logs", root) >= sizeof(path)) {
         forge_util_set_error(error, error_size, "project root path is too long");
         return -1;
     }
@@ -70,15 +68,6 @@ static FILE *open_log_for_write(const char *path)
     return _fsopen(path, "w", _SH_DENYNO);
 #else
     return fopen(path, "w");
-#endif
-}
-
-static FILE *open_log_for_append(const char *path)
-{
-#if defined(FORGE_LOG_USE_FSOPEN)
-    return _fsopen(path, "a", _SH_DENYNO);
-#else
-    return fopen(path, "a");
 #endif
 }
 
@@ -150,12 +139,6 @@ int forge_logger_init_in(ForgeLogger *logger, const char *project_root,
     return -1;
 }
 
-int forge_logger_init(ForgeLogger *logger, const char *kind,
-                      char *error, size_t error_size)
-{
-    return forge_logger_init_in(logger, ".", kind, error, error_size);
-}
-
 static void write_log(ForgeLogger *logger, FILE *stream, const char *level,
                       const char *stage, const char *format, va_list arguments)
 {
@@ -200,33 +183,4 @@ void forge_logger_close(ForgeLogger *logger)
         (void)fclose(logger->file);
         logger->file = NULL;
     }
-}
-
-int forge_logger_suspend(ForgeLogger *logger, char *error, size_t error_size)
-{
-    if (logger == NULL || logger->file == NULL) {
-        return 0;
-    }
-    if (fflush(logger->file) != 0 || fclose(logger->file) != 0) {
-        logger->file = NULL;
-        forge_util_set_error(error, error_size, "could not close log '%s': %s",
-                  logger->path, strerror(errno));
-        return -1;
-    }
-    logger->file = NULL;
-    return 0;
-}
-
-int forge_logger_resume(ForgeLogger *logger, char *error, size_t error_size)
-{
-    if (logger == NULL || logger->file != NULL) {
-        return 0;
-    }
-    logger->file = open_log_for_append(logger->path);
-    if (logger->file == NULL) {
-        forge_util_set_error(error, error_size, "could not reopen log '%s': %s",
-                  logger->path, strerror(errno));
-        return -1;
-    }
-    return 0;
 }

@@ -268,7 +268,8 @@ static int parse_boolean(char *value, int *output, char *error, size_t error_siz
 }
 
 /* Dependency names become include paths and link inputs, so restrict them to
- * the same portable charset as project names. */
+ * the same portable ASCII charset forge uses everywhere else (explicit ranges
+ * rather than isalnum, which is locale-dependent). */
 static int dependency_name_is_valid(const char *name)
 {
     size_t index;
@@ -276,8 +277,10 @@ static int dependency_name_is_valid(const char *name)
     for (index = 0U; name[index] != '\0'; ++index) {
         unsigned char character = (unsigned char)name[index];
 
-        if (!isalnum(character) && character != '-' && character != '_' &&
-            character != '.') {
+        if (!((character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') ||
+              character == '-' || character == '_' || character == '.')) {
             return 0;
         }
     }
