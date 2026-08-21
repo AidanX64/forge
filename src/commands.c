@@ -3,6 +3,7 @@
 #include "forge/build.h"
 #include "forge/compiler.h"
 #include "forge/debug.h"
+#include "forge/deps.h"
 #include "forge/log.h"
 #include "forge/manifest.h"
 #include "forge/orchestrator.h"
@@ -112,6 +113,38 @@ int forge_orchestrate_test(const char *manifest_path, int release, int max_jobs)
                      result == 0 ? "success" : (result < 0 ? "failed" : "tests failed"));
     finish_invocation(&logger);
     return result < 0 ? 1 : result;
+}
+
+int forge_orchestrate_update(const char *manifest_path)
+{
+    ForgeManifest manifest;
+    ForgeLogger logger = {0};
+    ForgeDepGraph graph = {0};
+    char root[FORGE_PATH_MAX];
+    char error[FORGE_COMMAND_MAX] = {0};
+    int result;
+
+    if (load_invocation(manifest_path, "update", &logger, &manifest, root, sizeof(root)) != 0) {
+        finish_invocation(&logger);
+        return 1;
+    }
+    if (manifest.dependencies.count == 0U) {
+        forge_logger_log(&logger, "update", "no [dependencies] to update");
+        finish_invocation(&logger);
+        return 0;
+    }
+    result = forge_deps_resolve(root, &manifest, 1, &graph, &logger, error,
+                                sizeof(error)) == 0 ? 0 : 1;
+    if (result != 0 && error[0] != '\0') {
+        forge_logger_error(&logger, "update", "%s", error);
+    } else {
+        forge_logger_log(&logger, "update", "resolved %zu dependencies",
+                         graph.count);
+    }
+    forge_deps_free_graph(&graph);
+    forge_logger_log(&logger, "update", "result: %s", result == 0 ? "success" : "failed");
+    finish_invocation(&logger);
+    return result;
 }
 
 int forge_orchestrate_debug(const char *manifest_path, int release, int max_jobs)

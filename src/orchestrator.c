@@ -30,6 +30,7 @@
 #include "forge/compiler.h"
 #include "forge/debug.h"
 #include "forge/build.h"
+#include "forge/deps.h"
 #include "forge/fingerprint.h"
 #include "forge/log.h"
 #include "forge/manifest.h"
@@ -41,6 +42,80 @@
 #include "forge_util.h"
 
 static ForgeLogger *active_logger;
+
+/* Growable list of dependency object/library paths fed to the linker. */
+typedef struct ForgePathList {
+    char **items;
+    size_t count;
+    size_t capacity;
+} ForgePathList;
+
+static char *path_list_copy(const char *path)
+{
+    size_t length = strlen(path);
+    char *copy = malloc(length + 1U);
+
+    if (copy != NULL) {
+        memcpy(copy, path, length + 1U);
+    }
+    return copy;
+}
+
+static int path_list_push(ForgePathList *list, const char *path)
+{
+    if (list->count == list->capacity) {
+        size_t new_capacity = list->capacity == 0U ? 16U : list->capacity * 2U;
+        char **grown = realloc(list->items, new_capacity * sizeof(*grown));
+
+        if (grown == NULL) {
+            return -1;
+        }
+        list->items = grown;
+        list->capacity = new_capacity;
+    }
+    list->items[list->count] = path_list_copy(path);
+    if (list->items[list->count] == NULL) {
+        return -1;
+    }
+    ++list->count;
+    return 0;
+}
+
+static void path_list_free(ForgePathList *list)
+{
+    size_t index;
+
+    for (index = 0U; index < list->count; ++index) {
+        free(list->items[index]);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0U;
+    list->capacity = 0U;
+}
+
+/* Reads one path per line (the objects.txt a DEP_OBJECTS build wrote). */
+static int read_path_list(const char *file_path, ForgePathList *list)
+{
+    FILE *file = fopen(file_path, "r");
+    char line[FORGE_PATH_MAX];
+
+    if (file == NULL) {
+        return 0; /* no recorded objects is not an error */
+    }
+    while (fgets(line, sizeof(line), file) != NULL) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (line[0] == '\0') {
+            continue;
+        }
+        if (path_list_push(list, line) != 0) {
+            (void)fclose(file);
+            return -1;
+        }
+    }
+    (void)fclose(file);
+    return 0;
+}
 
 static const char *log_capture_path(void)
 {
@@ -202,6 +277,7 @@ typedef struct ForgeCompileContext {
     const ForgeCompiler *compiler;
     const ForgeBuildProfile *profile;
     const ForgeSourceList *sources;
+    const ForgeStringList *extra_include_dirs;
     char (*object_paths)[FORGE_PATH_MAX];
     const char **object_references;
     const char *project_root;
@@ -264,7 +340,8 @@ static void compile_source_job(ForgeCompileContext *context, size_t source_index
                                          context->sources->items[source_index].language,
                                          source_path, object_path, context->project_root,
                                          context->target_os, context->target_arch,
-                                         context->profile, &argv, error, sizeof(error)) != 0) {
+                                         context->profile, context->extra_include_dirs,
+                                         &argv, error, sizeof(error)) != 0) {
         compile_fail(context, error);
         return;
     }
@@ -360,21 +437,28 @@ static int run_compile_pool(ForgeCompileContext *context, int max_jobs)
  * `sources_override` (a shallow list, never owned) replaces manifest source
  * discovery so the test runner can build one binary per test file, and
  * `output_name_override` replaces the sanitized project name as the
- * executable base name.
+ * executable base name. When `resolve_dependencies` is set, [dependencies]
+ * are resolved and built first and their headers/objects feed this build;
+ * dependency builds recurse with the flag cleared.
  */
-static int build_binary(const char *project_root, const ForgeManifest *manifest,
-                        ForgeBuildMode mode, int release, int max_jobs,
-                        const ForgeSourceList *sources_override,
-                        const char *output_name_override,
-                        const char *const *program_arguments,
-                        size_t program_argument_count,
-                        char *built_executable, size_t built_executable_size,
-                        int *child_exit_code)
+static int build_binary_inner(const char *project_root, const ForgeManifest *manifest,
+                              ForgeBuildMode mode, int release, int max_jobs,
+                              const ForgeSourceList *sources_override,
+                              const char *output_name_override,
+                              const char *const *program_arguments,
+                              size_t program_argument_count,
+                              char *built_executable, size_t built_executable_size,
+                              int *child_exit_code, int resolve_dependencies)
 {
     ForgeHostInfo host;
     ForgeCompiler compiler;
     ForgeSourceList sources = {0};
     int owns_sources;
+    ForgeDepGraph dep_graph = {0};
+    ForgeStringList dep_includes = {0};
+    ForgePathList dep_link_inputs = {0};
+    int have_deps = 0;
+    size_t node_index;
     const ForgeBuildProfile *profile;
     const char *target_os;
     const char *target_arch;
@@ -424,6 +508,46 @@ static int build_binary(const char *project_root, const ForgeManifest *manifest,
             goto cleanup;
         }
         owns_sources = 1;
+    }
+
+    /* Resolve [dependencies] transitively and build every node before this
+     * project's own sources compile: their headers feed the compile lines
+     * and their objects/libraries the link line. */
+    if (resolve_dependencies && manifest->dependencies.count > 0U) {
+        if (forge_deps_resolve(project_root, manifest, 0, &dep_graph, active_logger,
+                               error, sizeof(error)) != 0) {
+            print_error("%s", error);
+            goto cleanup;
+        }
+        have_deps = 1;
+        if (forge_deps_include_dirs(&dep_graph, &dep_includes, error,
+                                    sizeof(error)) != 0) {
+            print_error("%s", error);
+            goto cleanup;
+        }
+        if (mode != FORGE_BUILD_MODE_COMPILE_ONLY) {
+            for (node_index = 0U; node_index < dep_graph.count; ++node_index) {
+                ForgeDepNode *node = &dep_graph.nodes[node_index];
+
+                if (node->is_native) {
+                    if (build_binary_inner(node->root, node->manifest,
+                                           FORGE_BUILD_MODE_DEP_OBJECTS, release,
+                                           max_jobs, NULL, 0U, NULL, 0U,
+                                           node->link_artifact,
+                                           sizeof(node->link_artifact),
+                                           NULL, 0) != 0) {
+                        print_error("dependency '%s' failed to build", node->name);
+                        goto cleanup;
+                    }
+                } else if (forge_deps_build_foreign(node, &compiler, release, max_jobs,
+                                                    active_logger, node->link_artifact,
+                                                    sizeof(node->link_artifact),
+                                                    error, sizeof(error)) != 0) {
+                    print_error("%s", error);
+                    goto cleanup;
+                }
+            }
+        }
     }
 
     profile = release ? &manifest->release_profile : &manifest->debug_profile;
@@ -496,6 +620,7 @@ static int build_binary(const char *project_root, const ForgeManifest *manifest,
     context.compiler = &compiler;
     context.profile = profile;
     context.sources = &sources;
+    context.extra_include_dirs = have_deps ? &dep_includes : NULL;
     context.object_paths = object_paths;
     context.object_references = object_references;
     context.project_root = project_root;
@@ -522,10 +647,68 @@ static int build_binary(const char *project_root, const ForgeManifest *manifest,
         goto cleanup;
     }
 
+    /* Dependency builds record their object paths so the consumer can link
+     * them directly without an intermediate archive. */
+    if (mode == FORGE_BUILD_MODE_DEP_OBJECTS) {
+        char list_path[FORGE_PATH_MAX];
+        FILE *list_file;
+        size_t list_index;
+
+        if (forge_paths_join(list_path, sizeof(list_path), profile_directory,
+                             "objects.txt") != 0) {
+            print_error("object list path is too long");
+            goto cleanup;
+        }
+        list_file = fopen(list_path, "w");
+        if (list_file == NULL) {
+            print_error("could not write '%s'", list_path);
+            goto cleanup;
+        }
+        for (list_index = 0U; list_index < sources.count; ++list_index) {
+            if (fprintf(list_file, "%s\n", object_references[list_index]) < 0) {
+                print_error("could not write '%s'", list_path);
+                (void)fclose(list_file);
+                goto cleanup;
+            }
+        }
+        if (fclose(list_file) != 0) {
+            print_error("could not write '%s'", list_path);
+            goto cleanup;
+        }
+        if (built_executable != NULL && built_executable_size != 0U) {
+            (void)snprintf(built_executable, built_executable_size, "%s", list_path);
+        }
+        result = 0;
+        goto cleanup;
+    }
+
+    /* Dependency objects/libraries resolve the project's symbols, so they
+     * are collected in reverse build order (dependents first). */
+    if (have_deps) {
+        for (node_index = dep_graph.count; node_index-- > 0U;) {
+            const ForgeDepNode *node = &dep_graph.nodes[node_index];
+
+            if (node->is_native) {
+                if (read_path_list(node->link_artifact, &dep_link_inputs) != 0) {
+                    print_error("could not read '%s'", node->link_artifact);
+                    goto cleanup;
+                }
+            } else if (node->link_artifact[0] != '\0') {
+                if (path_list_push(&dep_link_inputs, node->link_artifact) != 0) {
+                    print_error("out of memory while collecting dependency inputs");
+                    goto cleanup;
+                }
+            }
+        }
+    }
+
     argv = (ForgeArgv){0};
     if (forge_compiler_make_link_argv(&compiler, context.has_cpp_source, object_references,
-                                      sources.count, executable_path, profile_directory,
-                                      profile, &argv, &used_response_file, error,
+                                      sources.count,
+                                      (const char *const *)dep_link_inputs.items,
+                                      dep_link_inputs.count, executable_path,
+                                      profile_directory, profile, &argv,
+                                      &used_response_file, error,
                                       sizeof(error)) != 0) {
         print_error("%s", error);
         goto cleanup;
@@ -605,6 +788,8 @@ cleanup:
     if (owns_sources) {
         forge_sources_free(&sources);
     }
+    path_list_free(&dep_link_inputs);
+    forge_deps_free_graph(&dep_graph);
     return result;
 }
 
@@ -615,9 +800,10 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
                         char *built_executable, size_t built_executable_size,
                         int *child_exit_code)
 {
-    return build_binary(project_root, manifest, mode, release, max_jobs,
-                        NULL, NULL, program_arguments, program_argument_count,
-                        built_executable, built_executable_size, child_exit_code);
+    return build_binary_inner(project_root, manifest, mode, release, max_jobs,
+                              NULL, NULL, program_arguments, program_argument_count,
+                              built_executable, built_executable_size, child_exit_code,
+                              1);
 }
 
 /* Extracts the sanitized base name of `path` without its extension so each
@@ -704,9 +890,9 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
         single.capacity = 0U;
         forge_logger_log(active_logger, "test", "----- test %s (%s) -----",
                          name, tests.items[index].path);
-        status = build_binary(project_root, manifest, FORGE_BUILD_MODE_RUN, release,
-                              max_jobs, &single, name, NULL, 0U, NULL, 0U,
-                              &child_exit_code);
+        status = build_binary_inner(project_root, manifest, FORGE_BUILD_MODE_RUN, release,
+                                    max_jobs, &single, name, NULL, 0U, NULL, 0U,
+                                    &child_exit_code, 1);
         if (status != 0) {
             ++failed;
             print_log_tail(24U);

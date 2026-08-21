@@ -33,9 +33,11 @@ of raw C.)
 
 - `src/cli.c` parses command-line arguments.
 - `src/commands.c` owns the subcommand invocation lifecycles (`build`, `check`,
-  `run`, `test`, `debug`, `clean`, `new`, `init`).
+  `run`, `test`, `debug`, `clean`, `update`, `new`, `init`).
 - `src/orchestrator.c` is the build engine: source discovery, compiler dispatch,
   output layout, and build execution (compiles run on a thread pool).
+- `src/deps.c` resolves `[dependencies]`: git/path fetching, the shared cache,
+  `Forge.lock` pinning, graph resolution, and foreign CMake/Make builds.
 - `src/manifest.c`, `src/compiler.c`, `src/flags.c`, `src/log.c`, and
   `src/debug.c` provide the focused subsystems used by the build engine.
 - `src/scaffold.c` generates new project skeletons for `forge new` / `forge init`.
@@ -188,6 +190,32 @@ way to catch errors while editing, with incremental skips on repeat runs.
 `test result: N passed; M failed` summary, and exits nonzero when any fail.
 A missing or empty `tests/` directory is not an error.
 
+### Dependencies
+
+There is no npm-style registry for C — so forge treats **the VCS as the
+registry**, like CPM, Meson wrapdb, and vcpkg all do in their own way:
+
+```toml
+[dependencies]
+hello_lib = { path = "../libhello" }
+coolib    = { git = "https://github.com/example/coolib", tag = "v1.2" }   # branch/rev also work
+```
+
+- Git deps are cloned into a shared cache (`~/.forge/git`, override with
+  `FORGE_HOME`) and pinned by resolved commit SHA in a generated `Forge.lock`
+  — rebuilds after the first are quiet and offline-friendly. `forge update`
+  re-resolves refs to the newest allowed state.
+- Dependencies resolve transitively (each dep may have its own
+  `[dependencies]`); cycles are rejected with a clear error.
+- A dependency is built with whatever it ships:
+  - a `Forge.toml` → built natively by forge's own engine;
+  - a `CMakeLists.txt` → `cmake` configure + build;
+  - a `Makefile` → `make -jN CC=<dispatched compiler>`;
+  - anything else is an error naming the dependency.
+- Include directories (`<dep>/include`, else the dep root) feed every compile;
+  the dep's objects/static library (`.a`/`.lib`) feed the link line.
+  Dynamic libraries are out of scope for now.
+
 ### Cross-platform compiler dispatch
 Forge detects the host OS and version at build time and automatically
 invokes the platform's native compiler, falling back to `clang` when no
@@ -264,9 +292,11 @@ not just machine-parsed.
 
 v1 build orchestration is implemented and working: `forge build`, `forge
 check`, `forge run` (with `--` argument passthrough and exit-code
-propagation), `forge test`, `forge debug`, `forge clean`, `forge new`, and
-`forge init` cover the host build loop. Compiler dispatch, manifest parsing,
-upward manifest discovery, and per-invocation `target/logs` are in place.
+propagation), `forge test`, `forge debug`, `forge clean`, `forge update`,
+`forge new`, and `forge init` cover the host build loop. Path and git
+dependencies with lockfile pinning, plus foreign CMake/Make dependencies,
+are in place. Compiler dispatch, manifest parsing, upward manifest
+discovery, and per-invocation `target/logs` are in place.
 
 ## Author note 
 

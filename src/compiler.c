@@ -279,6 +279,41 @@ int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
     return 0;
 }
 
+/* Appends the project's own include directory plus any dependency include
+ * directories, translated into the compiler's dialect. */
+static int append_include_dirs(ForgeArgv *argv, const ForgeCompiler *compiler,
+                               const char *project_root,
+                               const ForgeStringList *extra_include_dirs,
+                               char *error, size_t error_size)
+{
+    size_t index;
+
+    if (compiler->kind == FORGE_COMPILER_MSVC) {
+        if (forge_argv_appendf(argv, "/I%s/include", project_root) != 0) {
+            goto out_of_memory;
+        }
+    } else if (forge_argv_appendf(argv, "-I%s/include", project_root) != 0) {
+        goto out_of_memory;
+    }
+    if (extra_include_dirs != NULL) {
+        for (index = 0U; index < extra_include_dirs->count; ++index) {
+            if (compiler->kind == FORGE_COMPILER_MSVC) {
+                if (forge_argv_appendf(argv, "/I%s",
+                                       extra_include_dirs->items[index]) != 0) {
+                    goto out_of_memory;
+                }
+            } else if (forge_argv_appendf(argv, "-I%s",
+                                          extra_include_dirs->items[index]) != 0) {
+                goto out_of_memory;
+            }
+        }
+    }
+    return 0;
+out_of_memory:
+    forge_util_set_error(error, error_size, "out of memory while building compile command");
+    return -1;
+}
+
 int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      ForgeSourceLanguage language,
                                      const char *source_path,
@@ -287,6 +322,7 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      const char *target_os,
                                      const char *target_arch,
                                      const ForgeBuildProfile *profile,
+                                     const ForgeStringList *extra_include_dirs,
                                      ForgeArgv *argv,
                                      char *error, size_t error_size)
 {
@@ -343,7 +379,8 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
          */
         if (forge_argv_append(argv, compiler->program) != 0 ||
             forge_argv_append(argv, "/nologo") != 0 ||
-            forge_argv_appendf(argv, "/I%s/include", project_root) != 0 ||
+            append_include_dirs(argv, compiler, project_root, extra_include_dirs,
+                                error, error_size) != 0 ||
             forge_argv_append(argv, "/c") != 0 ||
             forge_argv_appendf(argv, "/Fo%s", object_path) != 0 ||
             forge_argv_append(argv, source_path) != 0) {
@@ -351,45 +388,46 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
             forge_argv_free(argv);
             return -1;
         }
+    } else if (language == FORGE_SOURCE_ASM) {
+        /* Plain assembly has no headers to record in a dependency file. */
+        program = compiler->program;
+        if (forge_argv_append(argv, program) != 0 ||
+            append_include_dirs(argv, compiler, project_root, extra_include_dirs,
+                                error, error_size) != 0 ||
+            forge_argv_append(argv, "-c") != 0 ||
+            forge_argv_append(argv, source_path) != 0 ||
+            forge_argv_append(argv, "-o") != 0 ||
+            forge_argv_append(argv, object_path) != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building compile command");
+            forge_argv_free(argv);
+            return -1;
+        }
     } else {
+        /*
+         * -MMD -MF has GCC/Clang write the headers this translation unit
+         * actually pulled in (system headers omitted) into a .d sibling of
+         * the object; Forge reads it back so a header edit recompiles only
+         * the files that use it.
+         */
         program = language == FORGE_SOURCE_CPP ? cpp_driver(compiler) : compiler->program;
-        if (language == FORGE_SOURCE_ASM) {
-            /* Plain assembly has no preprocessor includes to track. */
-            if (forge_argv_append(argv, program) != 0 ||
-                forge_argv_appendf(argv, "-I%s/include", project_root) != 0 ||
-                forge_argv_append(argv, "-c") != 0 ||
-                forge_argv_append(argv, source_path) != 0 ||
-                forge_argv_append(argv, "-o") != 0 ||
-                forge_argv_append(argv, object_path) != 0) {
-                forge_util_set_error(error, error_size, "out of memory while building compile command");
-                forge_argv_free(argv);
-                return -1;
-            }
-        } else {
-            /*
-             * -MMD -MF has GCC/Clang write the headers this translation unit
-             * actually pulled in (system headers omitted) into a .d sibling of
-             * the object; Forge reads it back so a header edit recompiles only
-             * the files that use it.
-             */
-            if (forge_compiler_depfile_path(object_path, depfile_path,
-                                            sizeof(depfile_path)) != 0) {
-                forge_util_set_error(error, error_size, "dependency file path is too long");
-                return -1;
-            }
-            if (forge_argv_append(argv, program) != 0 ||
-                forge_argv_appendf(argv, "-I%s/include", project_root) != 0 ||
-                forge_argv_append(argv, "-MMD") != 0 ||
-                forge_argv_append(argv, "-MF") != 0 ||
-                forge_argv_append(argv, depfile_path) != 0 ||
-                forge_argv_append(argv, "-c") != 0 ||
-                forge_argv_append(argv, source_path) != 0 ||
-                forge_argv_append(argv, "-o") != 0 ||
-                forge_argv_append(argv, object_path) != 0) {
-                forge_util_set_error(error, error_size, "out of memory while building compile command");
-                forge_argv_free(argv);
-                return -1;
-            }
+        if (forge_compiler_depfile_path(object_path, depfile_path,
+                                        sizeof(depfile_path)) != 0) {
+            forge_util_set_error(error, error_size, "dependency file path is too long");
+            return -1;
+        }
+        if (forge_argv_append(argv, program) != 0 ||
+            append_include_dirs(argv, compiler, project_root, extra_include_dirs,
+                                error, error_size) != 0 ||
+            forge_argv_append(argv, "-MMD") != 0 ||
+            forge_argv_append(argv, "-MF") != 0 ||
+            forge_argv_append(argv, depfile_path) != 0 ||
+            forge_argv_append(argv, "-c") != 0 ||
+            forge_argv_append(argv, source_path) != 0 ||
+            forge_argv_append(argv, "-o") != 0 ||
+            forge_argv_append(argv, object_path) != 0) {
+            forge_util_set_error(error, error_size, "out of memory while building compile command");
+            forge_argv_free(argv);
+            return -1;
         }
     }
 
@@ -444,6 +482,8 @@ int forge_compiler_make_link_argv(const ForgeCompiler *compiler,
                                   int has_cpp_source,
                                   const char *const *object_paths,
                                   size_t object_count,
+                                  const char *const *extra_link_inputs,
+                                  size_t extra_link_input_count,
                                   const char *output_path,
                                   const char *response_dir,
                                   const ForgeBuildProfile *profile,
@@ -485,6 +525,17 @@ int forge_compiler_make_link_argv(const ForgeCompiler *compiler,
         if (object_paths[index] == NULL || object_paths[index][0] == '\0' ||
             forge_argv_append(argv, object_paths[index]) != 0) {
             forge_util_set_error(error, error_size, "invalid object file list");
+            forge_argv_free(argv);
+            return -1;
+        }
+    }
+
+    /* Dependency objects and static libraries resolve symbols from the
+     * project's own objects, so they come right after them. */
+    for (index = 0U; index < extra_link_input_count; ++index) {
+        if (extra_link_inputs[index] == NULL || extra_link_inputs[index][0] == '\0' ||
+            forge_argv_append(argv, extra_link_inputs[index]) != 0) {
+            forge_util_set_error(error, error_size, "invalid dependency link input list");
             forge_argv_free(argv);
             return -1;
         }

@@ -15,6 +15,8 @@ int forge_orchestrate_run(const char *manifest_path, int release, int max_jobs,
                           size_t program_argument_count);
 /* Builds and runs every standalone test source in tests/. */
 int forge_orchestrate_test(const char *manifest_path, int release, int max_jobs);
+/* Re-resolves [dependencies] refs and rewrites Forge.lock. */
+int forge_orchestrate_update(const char *manifest_path);
 int forge_orchestrate_debug(const char *manifest_path, int release, int max_jobs);
 int forge_orchestrate_clean(const char *manifest_path);
 /* Scaffolds a new project directory named `name` / initializes the cwd. */

@@ -5,11 +5,27 @@
 
 #define FORGE_MANIFEST_MAX_ITEMS 128U
 #define FORGE_MANIFEST_VALUE_MAX 256U
+#define FORGE_MANIFEST_MAX_DEPS 64U
 
 typedef struct ForgeStringList {
     char items[FORGE_MANIFEST_MAX_ITEMS][FORGE_MANIFEST_VALUE_MAX];
     size_t count;
 } ForgeStringList;
+
+/* One entry of [dependencies]: either a path dependency or a git dependency
+ * pinned by ref (tag, branch, or rev); the lockfile records the resolved
+ * commit. */
+typedef struct ForgeDependency {
+    char name[FORGE_MANIFEST_VALUE_MAX];
+    char git_url[FORGE_MANIFEST_VALUE_MAX];
+    char ref[FORGE_MANIFEST_VALUE_MAX];
+    char path[FORGE_MANIFEST_VALUE_MAX];
+} ForgeDependency;
+
+typedef struct ForgeDependencyList {
+    ForgeDependency items[FORGE_MANIFEST_MAX_DEPS];
+    size_t count;
+} ForgeDependencyList;
 
 typedef struct ForgeBuildProfile {
     int opt_level; /* -1 = compiler default; 0..3 = -O0..-O3 / /Od.. /O2 */
@@ -27,6 +43,7 @@ typedef struct ForgeManifest {
     ForgeStringList target_os;
     ForgeStringList target_arch;
     char compiler_override[FORGE_MANIFEST_VALUE_MAX];
+    ForgeDependencyList dependencies;
     ForgeBuildProfile debug_profile;
     ForgeBuildProfile release_profile;
 } ForgeManifest;

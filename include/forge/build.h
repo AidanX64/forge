@@ -10,7 +10,10 @@
 typedef enum ForgeBuildMode {
     FORGE_BUILD_MODE_LINK,      /* compile then link (forge build) */
     FORGE_BUILD_MODE_RUN,       /* compile, link, execute (forge run/test) */
-    FORGE_BUILD_MODE_COMPILE_ONLY /* compile without linking (forge check) */
+    FORGE_BUILD_MODE_COMPILE_ONLY, /* compile without linking (forge check) */
+    /* Internal: compile a dependency project and record its object paths in
+     * <profile>/objects.txt; `built_executable` receives that file's path. */
+    FORGE_BUILD_MODE_DEP_OBJECTS
 } ForgeBuildMode;
 
 /* The build engine operates on a parsed manifest and an invocation logger. */

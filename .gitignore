@@ -1,6 +1,13 @@
+# Build outputs
 /target/
 /test/target/
 /build/
+*/build/
 *.exe
 *.obj
 *.o
+*.a
+*.lib
+
+# Example scaffolding (kept out of the repo on purpose)
+/examples/

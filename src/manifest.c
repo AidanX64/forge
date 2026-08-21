@@ -2,6 +2,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,9 +18,19 @@ typedef enum ForgeManifestSection {
     FORGE_SECTION_SOURCES,
     FORGE_SECTION_TARGETS,
     FORGE_SECTION_BUILD,
+    FORGE_SECTION_DEPENDENCIES,
     FORGE_SECTION_PROFILE_DEBUG,
     FORGE_SECTION_PROFILE_RELEASE
 } ForgeManifestSection;
+
+/* One key = "value" pair inside an inline table ({ git = "...", tag = "..." }). */
+#define FORGE_INLINE_KEY_MAX 32U
+#define FORGE_INLINE_MAX_ENTRIES 8U
+
+typedef struct ForgeInlineEntry {
+    char key[FORGE_INLINE_KEY_MAX];
+    char value[FORGE_MANIFEST_VALUE_MAX];
+} ForgeInlineEntry;
 
 typedef struct ForgeProfileSeen {
     int opt_level;
@@ -176,6 +187,9 @@ static ForgeManifestSection parse_section(const char *text)
     if (strcmp(text, "[build]") == 0) {
         return FORGE_SECTION_BUILD;
     }
+    if (strcmp(text, "[dependencies]") == 0) {
+        return FORGE_SECTION_DEPENDENCIES;
+    }
     if (strcmp(text, "[profile.debug]") == 0) {
         return FORGE_SECTION_PROFILE_DEBUG;
     }
@@ -251,6 +265,221 @@ static int parse_boolean(char *value, int *output, char *error, size_t error_siz
     }
     forge_util_set_error(error, error_size, "expected 'true' or 'false'");
     return -1;
+}
+
+/* Dependency names become include paths and link inputs, so restrict them to
+ * the same portable charset as project names. */
+static int dependency_name_is_valid(const char *name)
+{
+    size_t index;
+
+    for (index = 0U; name[index] != '\0'; ++index) {
+        unsigned char character = (unsigned char)name[index];
+
+        if (!isalnum(character) && character != '-' && character != '_' &&
+            character != '.') {
+            return 0;
+        }
+    }
+    return name[0] != '\0';
+}
+
+/*
+ * Parses a strict inline table: '{' key = "string" (, key = "string")* '}'.
+ * Bare keys are short identifiers; values are quoted strings; trailing
+ * commas are rejected like everywhere else in the manifest.
+ */
+static int parse_inline_table(char *value, ForgeInlineEntry *entries,
+                              size_t max_entries, size_t *entry_count,
+                              char *error, size_t error_size)
+{
+    char *cursor = forge_util_trim(value);
+    size_t count = 0U;
+
+    *entry_count = 0U;
+    if (*cursor != '{') {
+        forge_util_set_error(error, error_size,
+                  "expected an inline table starting with '{'");
+        return -1;
+    }
+    ++cursor;
+    cursor = forge_util_trim(cursor);
+    if (*cursor == '}') {
+        cursor = forge_util_trim(cursor + 1);
+        if (*cursor != '\0') {
+            forge_util_set_error(error, error_size, "unexpected text after inline table");
+            return -1;
+        }
+        return 0;
+    }
+    for (;;) {
+        ForgeInlineEntry *entry;
+        char *key_start;
+
+        if (count == max_entries) {
+            forge_util_set_error(error, error_size, "inline table has too many entries");
+            return -1;
+        }
+        entry = &entries[count];
+        key_start = cursor;
+        while (isalnum((unsigned char)*cursor) || *cursor == '-' || *cursor == '_' ||
+               *cursor == '.') {
+            ++cursor;
+        }
+        if (cursor == key_start) {
+            forge_util_set_error(error, error_size, "expected a key in inline table");
+            return -1;
+        }
+        if ((size_t)(cursor - key_start) >= FORGE_INLINE_KEY_MAX) {
+            forge_util_set_error(error, error_size, "inline table key is too long");
+            return -1;
+        }
+        memcpy(entry->key, key_start, (size_t)(cursor - key_start));
+        entry->key[cursor - key_start] = '\0';
+        cursor = forge_util_trim(cursor);
+        if (*cursor != '=') {
+            forge_util_set_error(error, error_size,
+                      "expected '=' after '%s' in inline table", entry->key);
+            return -1;
+        }
+        cursor = forge_util_trim(cursor + 1);
+        if (parse_string(&cursor, entry->value, sizeof(entry->value),
+                         error, error_size) != 0) {
+            return -1;
+        }
+        ++count;
+        cursor = forge_util_trim(cursor);
+        if (*cursor == '}') {
+            cursor = forge_util_trim(cursor + 1);
+            if (*cursor != '\0') {
+                forge_util_set_error(error, error_size, "unexpected text after inline table");
+                return -1;
+            }
+            *entry_count = count;
+            return 0;
+        }
+        if (*cursor != ',') {
+            forge_util_set_error(error, error_size,
+                      "expected ',' or '}' in inline table");
+            return -1;
+        }
+        cursor = forge_util_trim(cursor + 1);
+        if (*cursor == '}') {
+            forge_util_set_error(error, error_size,
+                      "trailing commas are not allowed in inline tables");
+            return -1;
+        }
+    }
+}
+
+static const ForgeInlineEntry *find_inline_entry(const ForgeInlineEntry *entries,
+                                                 size_t count, const char *key)
+{
+    size_t index;
+
+    for (index = 0U; index < count; ++index) {
+        if (strcmp(entries[index].key, key) == 0) {
+            return &entries[index];
+        }
+    }
+    return NULL;
+}
+
+static int parse_dependency_assignment(ForgeDependencyList *list, const char *name,
+                                       char *value, char *error, size_t error_size)
+{
+    ForgeInlineEntry entries[FORGE_INLINE_MAX_ENTRIES];
+    ForgeDependency *dependency;
+    const ForgeInlineEntry *entry;
+    size_t count = 0U;
+    size_t index;
+
+    if (!dependency_name_is_valid(name)) {
+        forge_util_set_error(error, error_size,
+                  "'%s' is not a valid dependency name; use letters, digits, '-', '_', '.'",
+                  name);
+        return -1;
+    }
+    for (index = 0U; index < list->count; ++index) {
+        if (strcmp(list->items[index].name, name) == 0) {
+            forge_util_set_error(error, error_size, "duplicate dependency '%s'", name);
+            return -1;
+        }
+    }
+    if (parse_inline_table(value, entries, FORGE_INLINE_MAX_ENTRIES, &count,
+                           error, error_size) != 0) {
+        return -1;
+    }
+    if (count == 0U) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s' needs a 'path' or 'git' source", name);
+        return -1;
+    }
+    entry = find_inline_entry(entries, count, "path");
+    if (entry != NULL && find_inline_entry(entries, count, "git") != NULL) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s' cannot have both 'path' and 'git'", name);
+        return -1;
+    }
+    if (list->count == FORGE_MANIFEST_MAX_DEPS) {
+        forge_util_set_error(error, error_size, "more than %u dependencies",
+                  FORGE_MANIFEST_MAX_DEPS);
+        return -1;
+    }
+    dependency = &list->items[list->count];
+    (void)snprintf(dependency->name, sizeof(dependency->name), "%s", name);
+    dependency->git_url[0] = '\0';
+    dependency->ref[0] = '\0';
+    dependency->path[0] = '\0';
+    if (entry != NULL) {
+        if (find_inline_entry(entries, count, "tag") != NULL ||
+            find_inline_entry(entries, count, "branch") != NULL ||
+            find_inline_entry(entries, count, "rev") != NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': refs only apply to git dependencies", name);
+            return -1;
+        }
+        (void)snprintf(dependency->path, sizeof(dependency->path), "%s", entry->value);
+    } else {
+        static const char *const ref_keys[] = { "tag", "branch", "rev" };
+        size_t key_index;
+
+        (void)snprintf(dependency->git_url, sizeof(dependency->git_url), "%s",
+                       find_inline_entry(entries, count, "git")->value);
+        for (key_index = 0U; key_index < 3U; ++key_index) {
+            entry = find_inline_entry(entries, count, ref_keys[key_index]);
+            if (entry == NULL) {
+                continue;
+            }
+            if (dependency->ref[0] != '\0') {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s' has multiple refs; use one of tag/branch/rev",
+                          name);
+                return -1;
+            }
+            (void)snprintf(dependency->ref, sizeof(dependency->ref), "%s", entry->value);
+        }
+    }
+    /* Reject unknown keys so typos fail loudly. */
+    for (index = 0U; index < count; ++index) {
+        static const char *const allowed[] = { "path", "git", "tag", "branch", "rev" };
+        size_t allowed_index;
+        int known = 0;
+
+        for (allowed_index = 0U; allowed_index < 5U; ++allowed_index) {
+            if (strcmp(entries[index].key, allowed[allowed_index]) == 0) {
+                known = 1;
+                break;
+            }
+        }
+        if (!known) {
+            forge_util_set_error(error, error_size,
+                      "unknown field '%s' in dependency '%s'", entries[index].key, name);
+            return -1;
+        }
+    }
+    ++list->count;
+    return 0;
 }
 
 /* Applies a profile section assignment, sharing the parser between
@@ -334,7 +563,11 @@ static int parse_assignment(ForgeManifestSection section, char *line,
                parse_scalar(value, manifest->compiler_override,
                             sizeof(manifest->compiler_override), error, error_size);
     }
-if (section == FORGE_SECTION_PROFILE_DEBUG) {
+    if (section == FORGE_SECTION_DEPENDENCIES) {
+        return parse_dependency_assignment(&manifest->dependencies, key, value,
+                                           error, error_size);
+    }
+    if (section == FORGE_SECTION_PROFILE_DEBUG) {
         return parse_profile_assignment(&seen->debug, &manifest->debug_profile,
                                         key, value, error, error_size);
     }

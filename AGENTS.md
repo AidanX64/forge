@@ -77,13 +77,16 @@ as possible, regardless of target OS, architecture, or toolchain.
    project-root anchoring from a plain working directory.
 
 ### Subcommand conventions
-- Subcommands: `build`, `check`, `run`, `test`, `debug`, `clean`, `new`,
-  `init`. New ones must stay Cargo-like verbs and compose with
+- Subcommands: `build`, `check`, `run`, `test`, `debug`, `clean`, `update`,
+  `new`, `init`. New ones must stay Cargo-like verbs and compose with
   `forge <verb> --release`.
 - `forge run -- ARGS...` passes ARGS to the program and propagates its exit
   code; keep that contract for anything that spawns user programs.
 - `forge test` builds each `tests/*.c` as a self-contained binary (own
   `main`); missing/empty `tests/` exits 0.
+- `[dependencies]` supports path deps and git deps pinned by commit in a
+  generated `Forge.lock`; foreign deps are detected as CMake or Make and
+  must produce a static library.
 - The forge version string lives in `include/forge/version.h`.
 
 ### Incremental-build caveats

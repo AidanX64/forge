@@ -20,6 +20,7 @@ static void print_usage(FILE *stream)
             "  forge test [--release] [--jobs N] [--manifest PATH]\n"
             "  forge debug [--release] [--jobs N] [--manifest PATH]\n"
             "  forge clean [--manifest PATH]\n"
+            "  forge update [--manifest PATH]   re-resolve dependencies\n"
             "  forge new <NAME>      scaffold a new project directory\n"
             "  forge init            scaffold into the current directory\n");
 }
@@ -84,7 +85,9 @@ static int command_init(int argc, char **argv)
     return forge_orchestrate_init();
 }
 
-static int command_clean(int argc, char **argv)
+/* Shared parser for the manifest-only commands (clean/update). */
+static int command_manifest_only(const char *command, int argc, char **argv,
+                                 int (*dispatch)(const char *))
 {
     const char *manifest_path = "Forge.toml";
     char discovered[FORGE_PATH_MAX];
@@ -96,12 +99,12 @@ static int command_clean(int argc, char **argv)
             manifest_path = argv[++index];
             explicit_manifest = 1;
         } else {
-            fprintf(stderr, "forge: unsupported clean option '%s'\n", argv[index]);
+            fprintf(stderr, "forge: unsupported %s option '%s'\n", command, argv[index]);
             return 1;
         }
     }
     discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
-    return forge_orchestrate_clean(manifest_path);
+    return dispatch(manifest_path);
 }
 
 /* Shared parser for build/check/run/test/debug: profile and job flags plus
@@ -183,6 +186,7 @@ int forge_cli_main(int argc, char **argv)
     if (strcmp(command, "build") != 0 && strcmp(command, "check") != 0 &&
         strcmp(command, "run") != 0 && strcmp(command, "test") != 0 &&
         strcmp(command, "debug") != 0 && strcmp(command, "clean") != 0 &&
+        strcmp(command, "update") != 0 &&
         strcmp(command, "new") != 0 && strcmp(command, "init") != 0) {
         fprintf(stderr, "forge: unsupported command '%s'\n", argv[1]);
         print_usage(stderr);
@@ -195,7 +199,10 @@ int forge_cli_main(int argc, char **argv)
         return command_init(argc, argv);
     }
     if (strcmp(command, "clean") == 0) {
-        return command_clean(argc, argv);
+        return command_manifest_only(command, argc, argv, forge_orchestrate_clean);
+    }
+    if (strcmp(command, "update") == 0) {
+        return command_manifest_only(command, argc, argv, forge_orchestrate_update);
     }
     return command_build_like(command, argc, argv);
 }

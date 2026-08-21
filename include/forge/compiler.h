@@ -61,7 +61,9 @@ int forge_compiler_select(const ForgeHostInfo *host, const char *override_progra
 int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
                                 size_t depfile_size);
 
-/* Builds the argv for compiling one source file to one object file. */
+/* Builds the argv for compiling one source file to one object file. Extra
+ * include directories (dependency headers) are appended after the project's
+ * own include directory in the compiler's dialect. */
 int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      ForgeSourceLanguage language,
                                      const char *source_path,
@@ -70,20 +72,25 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      const char *target_os,
                                      const char *target_arch,
                                      const ForgeBuildProfile *profile,
+                                     const ForgeStringList *extra_include_dirs,
                                      ForgeArgv *argv,
                                      char *error, size_t error_size);
 
 /*
- * Builds the argv for linking object files into an executable. When the
- * flattened command line would exceed what the OS accepts, the object list and
- * flags are spilled into a compiler response file in `response_dir` and the
- * compiler is invoked with @<file>; *used_response_file reports whether that
- * happened so callers can log and clean up.
+ * Builds the argv for linking object files into an executable. Static
+ * libraries and dependency objects (`extra_link_inputs`) are appended after
+ * the project's own objects. When the flattened command line would exceed
+ * what the OS accepts, the object list and flags are spilled into a compiler
+ * response file in `response_dir` and the compiler is invoked with @<file>;
+ * *used_response_file reports whether that happened so callers can log and
+ * clean up.
  */
 int forge_compiler_make_link_argv(const ForgeCompiler *compiler,
                                   int has_cpp_source,
                                   const char *const *object_paths,
                                   size_t object_count,
+                                  const char *const *extra_link_inputs,
+                                  size_t extra_link_input_count,
                                   const char *output_path,
                                   const char *response_dir,
                                   const ForgeBuildProfile *profile,
