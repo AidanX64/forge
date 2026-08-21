@@ -453,7 +453,7 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     ForgeHostInfo host;
     ForgeCompiler compiler;
     ForgeSourceList sources = {0};
-    int owns_sources;
+    int owns_sources = 0;
     ForgeDepGraph dep_graph = {0};
     ForgeStringList dep_includes = {0};
     ForgePathList dep_link_inputs = {0};
