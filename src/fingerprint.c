@@ -4,11 +4,15 @@
 
 #include "forge/platform.h"
 
-#if !FORGE_PLATFORM_WINDOWS
+#if !FORGE_PLATFORM_WINDOWS && !defined(__APPLE__)
 /*
  * st_mtim (nanosecond modification times) needs POSIX.1-2008 on glibc/musl;
  * without this the fallback would silently drop to one-second granularity
  * and quick edit-rebuild cycles could be missed.
+ *
+ * Apple is excluded on purpose: requesting strict POSIX mode there hides the
+ * BSD st_mtimespec member of struct stat (the only nanosecond source macOS
+ * provides), so Darwin must keep its default all-visibility environment.
  */
 #define _POSIX_C_SOURCE 200809L
 #endif
