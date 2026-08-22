@@ -167,10 +167,127 @@ static char *build_command_line(char *const *argv, char *error, size_t error_siz
     return line;
 }
 
+#define FORGE_PROCESS_PATH_MAX 1024U
+
+/*
+ * S4 gate: with a NULL application name, CreateProcess resolves a bare
+ * program name against the calling application's directory and the current
+ * working directory before PATH — so a hostile repository containing
+ * git.exe/make.exe/cmake.exe could shadow the real toolchain for any forge
+ * invocation made from inside it. Resolve the program the way execvp does
+ * instead: an explicit path is canonicalized as given, otherwise each PATH
+ * entry is probed and the current directory is never consulted implicitly.
+ * The absolute result is pinned via lpApplicationName so CreateProcess takes
+ * it verbatim instead of re-running its own search.
+ */
+static int file_exists_program(const char *path)
+{
+    DWORD attributes = GetFileAttributesA(path);
+
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U;
+}
+
+static int probe_program(const char *directory, size_t directory_length,
+                         const char *program, char *resolved,
+                         size_t resolved_size)
+{
+    int needs_separator = directory_length != 0U &&
+                          directory[directory_length - 1U] != '/' &&
+                          directory[directory_length - 1U] != '\\';
+
+    if (snprintf(resolved, resolved_size, "%.*s%s%s",
+                 (int)directory_length, directory,
+                 needs_separator ? "\\" : "", program) < 0 ||
+        strlen(resolved) >= resolved_size) {
+        return 0;
+    }
+    if (file_exists_program(resolved)) {
+        return 1;
+    }
+    if (snprintf(resolved, resolved_size, "%.*s%s%s.exe",
+                 (int)directory_length, directory,
+                 needs_separator ? "\\" : "", program) < 0 ||
+        strlen(resolved) >= resolved_size) {
+        return 0;
+    }
+    return file_exists_program(resolved);
+}
+
+static int resolve_executable(const char *program, char *resolved,
+                              size_t resolved_size, char *error,
+                              size_t error_size)
+{
+    const char *path_value;
+    const char *cursor;
+
+    if (strchr(program, '/') != NULL || strchr(program, '\\') != NULL ||
+        (program[0] != '\0' && program[1] == ':')) {
+        DWORD length = GetFullPathNameA(program, (DWORD)resolved_size,
+                                        resolved, NULL);
+
+        if (length == 0U || length >= resolved_size) {
+            (void)snprintf(error, error_size, "program path is too long: '%s'",
+                           program);
+            return -1;
+        }
+        if (!file_exists_program(resolved)) {
+            (void)snprintf(error, error_size, "program not found: '%s'",
+                           resolved);
+            return -1;
+        }
+        return 0;
+    }
+    path_value = getenv("PATH");
+    if (path_value == NULL) {
+        (void)snprintf(error, error_size, "'%s' was not found (PATH is not set)",
+                       program);
+        return -1;
+    }
+    cursor = path_value;
+    for (;;) {
+        const char *end = strchr(cursor, ';');
+        size_t entry_length;
+        const char *entry = cursor;
+        size_t trimmed_length;
+
+        if (end == NULL) {
+            end = cursor + strlen(cursor);
+        }
+        entry_length = (size_t)(end - cursor);
+        /* Tolerate quoted entries ("C:\some dir") by skipping the quotes. */
+        while (entry_length >= 2U && entry[0] == '"' &&
+               entry[entry_length - 1U] == '"') {
+            ++entry;
+            entry_length -= 2U;
+        }
+        trimmed_length = entry_length;
+        while (trimmed_length > 0U &&
+               (entry[trimmed_length - 1U] == ' ' ||
+                entry[trimmed_length - 1U] == '\t')) {
+            --trimmed_length;
+        }
+        if (trimmed_length != 0U &&
+            probe_program(entry, trimmed_length, program, resolved,
+                          resolved_size)) {
+            return 0;
+        }
+        if (*end == '\0') {
+            break;
+        }
+        cursor = end + 1;
+    }
+    (void)snprintf(error, error_size,
+                   "'%s' was not found in PATH; install it or extend PATH",
+                   program);
+    return -1;
+}
+
 int forge_process_run(char *const *argv, const char *redirect_to,
                       int appending, int *exit_code, char *error, size_t error_size)
 {
     char *command_line;
+    char executable[FORGE_PROCESS_PATH_MAX];
     HANDLE redirected = NULL;
     STARTUPINFOA startup;
     PROCESS_INFORMATION process;
@@ -180,6 +297,10 @@ int forge_process_run(char *const *argv, const char *redirect_to,
         if (error != NULL && error_size != 0U) {
             (void)snprintf(error, error_size, "argv and exit code output are required");
         }
+        return -1;
+    }
+    if (resolve_executable(argv[0], executable, sizeof(executable),
+                           error, error_size) != 0) {
         return -1;
     }
     if (redirect_to != NULL) {
@@ -211,8 +332,8 @@ int forge_process_run(char *const *argv, const char *redirect_to,
     startup.hStdOutput = redirected != NULL ? redirected : GetStdHandle(STD_OUTPUT_HANDLE);
     startup.hStdError = redirected != NULL ? redirected : GetStdHandle(STD_ERROR_HANDLE);
 
-    if (CreateProcessA(NULL, command_line, NULL, NULL, TRUE, 0, NULL, NULL,
-                       &startup, &process) == 0) {
+    if (CreateProcessA(executable, command_line, NULL, NULL, TRUE, 0, NULL,
+                       NULL, &startup, &process) == 0) {
         if (error != NULL && error_size != 0U) {
             (void)snprintf(error, error_size,
                            "could not start '%s' (error %lu)", argv[0],
