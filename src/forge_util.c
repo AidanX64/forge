@@ -3,6 +3,7 @@
 #endif
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,4 +143,72 @@ int forge_util_program_available(const char *program)
         }
         path_value = end + 1;
     }
+}
+
+/*
+ * The temporary lives in the same directory as the final file so the swap is
+ * a same-volume rename (atomic on every supported platform). A fixed ".tmp"
+ * suffix keeps names predictable and easy to clean up by hand; concurrent
+ * forge processes writing the same destination race only on the rename,
+ * which last-writer-wins as a complete file either way.
+ */
+int forge_util_replace_file(const char *final_path,
+                            int (*write_body)(void *user_data, FILE *file),
+                            void *user_data,
+                            char *error, size_t error_size)
+{
+    char temporary[FORGE_UTIL_PATH_MAX];
+    FILE *file;
+    int body_failed;
+    int written;
+
+    if (final_path == NULL || write_body == NULL) {
+        forge_util_set_error(error, error_size, "atomic write needs a path and a writer");
+        return -1;
+    }
+    written = snprintf(temporary, sizeof(temporary), "%s.tmp", final_path);
+    if (written < 0 || (size_t)written >= sizeof(temporary)) {
+        forge_util_set_error(error, error_size, "path is too long for an atomic write: %s",
+                  final_path);
+        return -1;
+    }
+    file = fopen(temporary, "wb");
+    if (file == NULL) {
+        forge_util_set_error(error, error_size, "could not write '%s'", temporary);
+        return -1;
+    }
+    body_failed = write_body(user_data, file) != 0;
+    if (!body_failed && fflush(file) != 0) {
+        body_failed = 1;
+    }
+    if (fclose(file) != 0) {
+        body_failed = 1;
+    }
+    if (body_failed) {
+        (void)remove(temporary);
+        forge_util_set_error(error, error_size, "could not write '%s'", final_path);
+        return -1;
+    }
+#if FORGE_PLATFORM_WINDOWS
+    if (MoveFileExA(temporary, final_path, MOVEFILE_REPLACE_EXISTING) == 0) {
+        DWORD replace_error = GetLastError();
+
+        (void)remove(temporary);
+        forge_util_set_error(error, error_size,
+                  "could not put the new contents of '%s' in place (error %lu)",
+                  final_path, (unsigned long)replace_error);
+        return -1;
+    }
+#else
+    if (rename(temporary, final_path) != 0) {
+        int rename_errno = errno;
+
+        (void)remove(temporary);
+        forge_util_set_error(error, error_size,
+                  "could not put the new contents of '%s' in place: %s",
+                  final_path, strerror(rename_errno));
+        return -1;
+    }
+#endif
+    return 0;
 }
