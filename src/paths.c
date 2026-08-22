@@ -297,8 +297,24 @@ static int remove_tree_recursive(const char *path, char *error, size_t error_siz
             (void)FindClose(handle);
             return -1;
         }
-        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U &&
+            (entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U) {
+            /*
+             * A directory junction or symlink carries the reparse attribute:
+             * deleting the link itself must never descend into what it
+             * points at, or clean would delete files far outside target/.
+             */
             if (remove_tree_recursive(child, error, error_size) != 0) {
+                (void)FindClose(handle);
+                return -1;
+            }
+        } else if ((entry.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                              FILE_ATTRIBUTE_REPARSE_POINT)) != 0U) {
+            /* Directory link: RemoveDirectoryA unlinks it without following. */
+            if (RemoveDirectoryA(child) == 0) {
+                forge_util_set_error(error, error_size,
+                                     "could not remove directory link '%s' (error %lu)",
+                                     child, (unsigned long)GetLastError());
                 (void)FindClose(handle);
                 return -1;
             }
@@ -353,7 +369,12 @@ static int remove_tree_recursive(const char *path, char *error, size_t error_siz
             (void)closedir(stream);
             return -1;
         }
-        if (stat(child, &details) != 0) {
+        /*
+         * lstat, not stat: a symlink must be unlinked as the link itself.
+         * stat would follow it, so a symlink under target/ pointing at a
+         * real directory would get its *contents* deleted outside target/.
+         */
+        if (lstat(child, &details) != 0) {
             forge_util_set_error(error, error_size,
                                  "could not inspect '%s': %s", child, strerror(errno));
             (void)closedir(stream);

@@ -132,7 +132,22 @@ static unsigned int source_hash(const char *text)
  */
 static int dependency_is_stale(const char *path, const char *object_path)
 {
-    return forge_fingerprint_path_is_newer(path, object_path);
+    ForgeFileTime path_time;
+    ForgeFileTime reference_time;
+
+    /*
+     * The contract above is honored here rather than delegated to
+     * forge_fingerprint_path_is_newer, which reports "not newer" (0) when
+     * either stat fails — treating a deleted header as fresh would leave
+     * objects permanently built from a header that no longer exists.
+     */
+    if (file_time(path, &path_time) != 0) {
+        return 1;
+    }
+    if (file_time(object_path, &reference_time) != 0) {
+        return 1;
+    }
+    return time_is_newer(&path_time, &reference_time);
 }
 
 /*
