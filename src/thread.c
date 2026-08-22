@@ -65,18 +65,21 @@ int forge_thread_processor_count(void)
     return count < 1U ? 1 : (int)count;
 }
 
-void forge_mutex_init(ForgeMutex *mutex)
+int forge_mutex_init(ForgeMutex *mutex)
 {
     SRWLOCK *lock;
 
     if (mutex == NULL) {
-        return;
+        return -1;
     }
     lock = (SRWLOCK *)malloc(sizeof(*lock));
-    if (lock != NULL) {
-        InitializeSRWLock(lock);
+    if (lock == NULL) {
+        mutex->handle = NULL;
+        return -1;
     }
+    InitializeSRWLock(lock);
     mutex->handle = lock;
+    return 0;
 }
 
 void forge_mutex_destroy(ForgeMutex *mutex)
@@ -159,18 +162,24 @@ int forge_thread_processor_count(void)
     return count < 1L ? 1 : (int)count;
 }
 
-void forge_mutex_init(ForgeMutex *mutex)
+int forge_mutex_init(ForgeMutex *mutex)
 {
     pthread_mutex_t *lock;
 
     if (mutex == NULL) {
-        return;
+        return -1;
     }
+    mutex->handle = NULL;
     lock = (pthread_mutex_t *)malloc(sizeof(*lock));
-    if (lock != NULL) {
-        (void)pthread_mutex_init(lock, NULL);
+    if (lock == NULL) {
+        return -1;
+    }
+    if (pthread_mutex_init(lock, NULL) != 0) {
+        free(lock);
+        return -1;
     }
     mutex->handle = lock;
+    return 0;
 }
 
 void forge_mutex_destroy(ForgeMutex *mutex)

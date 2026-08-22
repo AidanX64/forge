@@ -21,7 +21,11 @@ int forge_thread_join(ForgeThread *thread);
 /* Recommended number of worker threads (logical processors; at least 1). */
 int forge_thread_processor_count(void);
 
-void forge_mutex_init(ForgeMutex *mutex);
+/* Initializes `mutex`; returns 0 on success and -1 when the lock could not
+ * be created. Callers must treat a failed init as fatal for the operation:
+ * lock/unlock on a dead mutex silently no-op, which would unsynchronize
+ * workers exactly when resources are scarce. */
+int forge_mutex_init(ForgeMutex *mutex);
 void forge_mutex_destroy(ForgeMutex *mutex);
 void forge_mutex_lock(ForgeMutex *mutex);
 void forge_mutex_unlock(ForgeMutex *mutex);
