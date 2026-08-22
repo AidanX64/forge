@@ -2,23 +2,29 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
-#include <errno.h>
-#include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
 #include "forge/platform.h"
 
 /*
  * Nanosecond clocks and terminal detection need POSIX visibility; requesting
  * it here (rather than relying on the build flags) keeps this file's console
  * and timing helpers self-contained.
+ *
+ * This must precede every libc include: glibc snapshots feature-test macros
+ * when its first header loads, so a later definition is silently ignored and
+ * -std=c2x strict mode would hide clock_gettime/CLOCK_MONOTONIC and fileno.
+ * Apple is excluded on purpose: strict POSIX there hides BSD extensions, and
+ * Darwin declares everything this file needs by default.
  */
 #if !FORGE_PLATFORM_WINDOWS && !defined(__APPLE__)
 #define _POSIX_C_SOURCE 200809L
 #endif
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
