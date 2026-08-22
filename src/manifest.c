@@ -403,6 +403,12 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
                   name);
         return -1;
     }
+    if (strlen(name) >= FORGE_MANIFEST_VALUE_MAX) {
+        forge_util_set_error(error, error_size,
+                  "dependency name is too long (%u characters maximum)",
+                  (unsigned int)(FORGE_MANIFEST_VALUE_MAX - 1U));
+        return -1;
+    }
     for (index = 0U; index < list->count; ++index) {
         if (strcmp(list->items[index].name, name) == 0) {
             forge_util_set_error(error, error_size, "duplicate dependency '%s'", name);
@@ -422,6 +428,12 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     if (entry != NULL && find_inline_entry(entries, count, "git") != NULL) {
         forge_util_set_error(error, error_size,
                   "dependency '%s' cannot have both 'path' and 'git'", name);
+        return -1;
+    }
+    if (find_inline_entry(entries, count, "submodules") != NULL && entry != NULL) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': submodules only apply to git dependencies",
+                  name);
         return -1;
     }
     if (list->count == FORGE_MANIFEST_MAX_DEPS) {
@@ -445,10 +457,26 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
         (void)snprintf(dependency->path, sizeof(dependency->path), "%s", entry->value);
     } else {
         static const char *const ref_keys[] = { "tag", "branch", "rev" };
+        const ForgeInlineEntry *submodules_entry;
         size_t key_index;
 
         (void)snprintf(dependency->git_url, sizeof(dependency->git_url), "%s",
                        find_inline_entry(entries, count, "git")->value);
+        submodules_entry = find_inline_entry(entries, count, "submodules");
+        if (submodules_entry != NULL) {
+            char flag_value[FORGE_MANIFEST_VALUE_MAX];
+
+            /* parse_boolean trims in place, so it needs a writable copy. */
+            (void)snprintf(flag_value, sizeof(flag_value), "%s",
+                           submodules_entry->value);
+            if (parse_boolean(flag_value, &dependency->submodules,
+                              error, error_size) != 0) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': submodules must be \"true\" or \"false\"",
+                          name);
+                return -1;
+            }
+        }
         for (key_index = 0U; key_index < 3U; ++key_index) {
             entry = find_inline_entry(entries, count, ref_keys[key_index]);
             if (entry == NULL) {
@@ -465,11 +493,13 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     }
     /* Reject unknown keys so typos fail loudly. */
     for (index = 0U; index < count; ++index) {
-        static const char *const allowed[] = { "path", "git", "tag", "branch", "rev" };
+        static const char *const allowed[] = {
+            "path", "git", "tag", "branch", "rev", "submodules"
+        };
         size_t allowed_index;
         int known = 0;
 
-        for (allowed_index = 0U; allowed_index < 5U; ++allowed_index) {
+        for (allowed_index = 0U; allowed_index < 6U; ++allowed_index) {
             if (strcmp(entries[index].key, allowed[allowed_index]) == 0) {
                 known = 1;
                 break;
@@ -588,6 +618,7 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
     FILE *file;
     char line[FORGE_MANIFEST_LINE_MAX];
     unsigned long line_number = 0UL;
+    unsigned int sections_seen = 0U;
     ForgeManifestSection section = FORGE_SECTION_NONE;
     ForgeManifestSeen seen = {0};
 
@@ -598,15 +629,53 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
     *manifest = (ForgeManifest){0};
     manifest->debug_profile.opt_level = -1;
     manifest->release_profile.opt_level = -1;
-    file = fopen(path, "r");
+    /* Binary mode keeps ftell exact, which the embedded-NUL check below
+     * relies on; \r\n endings are handled by the trim helpers instead. */
+    file = fopen(path, "rb");
     if (file == NULL) {
         forge_util_set_error(error, error_size, "could not open manifest '%s'", path);
         return -1;
     }
 
+    /*
+     * A UTF-8 byte-order mark is accepted (editors on Windows add one
+     * silently) but must be skipped before parsing; otherwise the first
+     * section header would read as "\xEF\xBB\xBF[project]" and fail with a
+     * confusing "unknown section".
+     */
+    {
+        char prefix[3];
+        size_t prefix_length = fread(prefix, 1U, sizeof(prefix), file);
+
+        if (prefix_length == 3U && (unsigned char)prefix[0] == 0xEFU &&
+            (unsigned char)prefix[1] == 0xBBU && (unsigned char)prefix[2] == 0xBFU) {
+            /* BOM consumed; parsing continues after it. */
+        } else if (fseek(file, 0L, SEEK_SET) != 0) {
+            forge_util_set_error(error, error_size,
+                      "could not rewind manifest '%s'", path);
+            (void)fclose(file);
+            return -1;
+        }
+    }
+
     while (fgets(line, sizeof(line), file) != NULL) {
         char *text;
+        long position_before = ftell(file) - (long)strlen(line);
+        long bytes_read = ftell(file) - position_before;
+
         ++line_number;
+        /*
+         * strlen must account for every byte fgets consumed; when it does
+         * not, an embedded NUL truncated the C string silently — reject
+         * binary contamination loudly instead of parsing half a line.
+         */
+        if ((long)strlen(line) != bytes_read || bytes_read <= 0L) {
+            forge_util_set_error(error, error_size,
+                      "%s:%lu: line contains an embedded NUL byte or invalid "
+                      "binary content", path, line_number);
+            (void)fclose(file);
+            return -1;
+        }
         if (strchr(line, '\n') == NULL && !feof(file)) {
             forge_util_set_error(error, error_size, "%s:%lu: line is too long", path, line_number);
             (void)fclose(file);
@@ -618,6 +687,8 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
             continue;
         }
         if (*text == '[') {
+            unsigned int section_bit = 1U << (unsigned int)parse_section(text);
+
             section = parse_section(text);
             if (section == FORGE_SECTION_NONE) {
                 forge_util_set_error(error, error_size, "%s:%lu: unknown section '%s'", path,
@@ -625,6 +696,18 @@ int forge_manifest_load(const char *path, ForgeManifest *manifest,
                 (void)fclose(file);
                 return -1;
             }
+            /*
+             * TOML forbids repeating a table; silently merging two
+             * [dependencies] blocks (say, one hand-written and one appended
+             * by `forge add`) hides exactly the edits users need to see.
+             */
+            if ((sections_seen & section_bit) != 0U) {
+                forge_util_set_error(error, error_size, "%s:%lu: duplicate section '%s'",
+                          path, line_number, text);
+                (void)fclose(file);
+                return -1;
+            }
+            sections_seen |= section_bit;
             continue;
         }
         if (section == FORGE_SECTION_NONE) {

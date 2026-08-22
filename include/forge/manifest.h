@@ -20,6 +20,8 @@ typedef struct ForgeDependency {
     char git_url[FORGE_MANIFEST_VALUE_MAX];
     char ref[FORGE_MANIFEST_VALUE_MAX];
     char path[FORGE_MANIFEST_VALUE_MAX];
+    /* Git deps only: clone/update git submodules alongside the checkout. */
+    int submodules;
 } ForgeDependency;
 
 typedef struct ForgeDependencyList {
