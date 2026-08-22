@@ -2,6 +2,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #endif
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -174,6 +175,38 @@ static int collect_sources_recursive(const char *directory, ForgeSourceLanguage 
 }
 #endif
 
+/* Case- and separator-insensitive comparison for canonical directory paths,
+ * mirroring the filesystem's own insensitivity on Windows. */
+static int same_directory_spelling(const char *left, const char *right)
+{
+    size_t index;
+
+    for (index = 0U; left[index] != '\0'; ++index) {
+        char left_character = left[index];
+        char right_character = right[index];
+
+        if (right_character == '\0') {
+            return 0;
+        }
+#if FORGE_PLATFORM_WINDOWS
+        if (tolower((unsigned char)left_character) !=
+            tolower((unsigned char)right_character)) {
+            int left_is_separator = left_character == '/' || left_character == '\\';
+            int right_is_separator = right_character == '/' || right_character == '\\';
+
+            if (!(left_is_separator && right_is_separator)) {
+                return 0;
+            }
+        }
+#else
+        if (left_character != right_character) {
+            return 0;
+        }
+#endif
+    }
+    return right[index] == '\0';
+}
+
 int forge_sources_collect(const char *project_root, const ForgeManifest *manifest,
                           ForgeSourceList *sources, char *error, size_t error_size)
 {
@@ -195,10 +228,22 @@ int forge_sources_collect(const char *project_root, const ForgeManifest *manifes
     }
     *sources = (ForgeSourceList){0};
     for (list_index = 0U; list_index < sizeof(lists) / sizeof(lists[0]); ++list_index) {
+        /*
+         * The same directory listed twice in one language would collect every
+         * file twice, producing two objects per translation unit and
+         * duplicate-symbol link errors. Directories may repeat across
+         * languages (c and cpp sharing "src" is normal), so the check below
+         * is scoped to a single list and compares canonical spellings.
+         */
+        char seen[FORGE_MANIFEST_MAX_ITEMS][FORGE_PATH_MAX];
+        size_t seen_count = 0U;
         size_t directory_index;
         for (directory_index = 0U; directory_index < lists[list_index]->count;
              ++directory_index) {
             char resolved[FORGE_PATH_MAX];
+            char canonical[FORGE_PATH_MAX];
+            size_t seen_index;
+
             if (forge_paths_resolve(project_root, lists[list_index]->items[directory_index],
                                     resolved, sizeof(resolved)) != 0) {
                 forge_util_set_error(error, error_size,
@@ -206,6 +251,22 @@ int forge_sources_collect(const char *project_root, const ForgeManifest *manifes
                           lists[list_index]->items[directory_index]);
                 forge_sources_free(sources);
                 return -1;
+            }
+            if (forge_paths_absolute(resolved, canonical, sizeof(canonical)) != 0) {
+                (void)snprintf(canonical, sizeof(canonical), "%s", resolved);
+            }
+            for (seen_index = 0U; seen_index < seen_count; ++seen_index) {
+                if (same_directory_spelling(seen[seen_index], canonical)) {
+                    forge_util_set_error(error, error_size,
+                              "source directory '%s' is listed more than once",
+                              lists[list_index]->items[directory_index]);
+                    forge_sources_free(sources);
+                    return -1;
+                }
+            }
+            if (seen_count < FORGE_MANIFEST_MAX_ITEMS) {
+                (void)snprintf(seen[seen_count], sizeof(seen[seen_count]), "%s", canonical);
+                ++seen_count;
             }
             if (collect_sources_recursive(resolved, languages[list_index], sources,
                                           error, error_size) != 0) {
