@@ -14,3 +14,6 @@
 
 # Local agent test scratch (not committed)
 /.scratch/
+
+# opencode session state (tooling, not project code)
+/.opencode/

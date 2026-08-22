@@ -221,7 +221,12 @@ coolib    = { git = "https://github.com/example/coolib", tag = "v1.2" }   # bran
 - Git deps are cloned into a shared cache (`~/.forge/git`, override with
   `FORGE_HOME`) and pinned by resolved commit SHA in a generated `Forge.lock`
   — rebuilds after the first are quiet and offline-friendly. `forge update`
-  re-resolves refs to the newest allowed state.
+  re-resolves refs to the newest allowed state; naming a dep
+  (`forge update coolib`) moves only that one past its pin.
+- Because manifest URLs go straight onto the `git clone` command line, git
+  URLs must use `https://`, `ssh://`, or scp-style `git@host:path` — anything
+  else (local paths, `file://`, exotic transports) is rejected unless
+  `FORGE_ALLOW_UNSAFE_GIT=1` is set in the environment.
 - Dependencies resolve transitively (each dep may have its own
   `[dependencies]`); cycles are rejected with a clear error.
 - A dependency is built with whatever it ships:
@@ -232,6 +237,19 @@ coolib    = { git = "https://github.com/example/coolib", tag = "v1.2" }   # bran
 - Include directories (`<dep>/include`, else the dep root) feed every compile;
   the dep's objects/static library (`.a`/`.lib`) feed the link line.
   Dynamic libraries are out of scope for now.
+
+**Trust model.** Resolving a dependency means trusting it: a foreign dep runs
+its own `cmake`/`make` scripts on your machine, and forge makes that
+explicit. The first time a foreign dep is built, forge asks before executing
+its build scripts and records the decision next to the clone; a fresh clone
+asks again.
+`FORGE_ALLOW_DEP_BUILD_SCRIPTS=1` pre-approves everything (CI),
+`=0` refuses outright. Git deps may also pull in their own git submodules
+with `submodules = "true"`. Lockfile commit pins are validated as full SHAs,
+so a hand-edited or corrupt `Forge.lock` fails loudly instead of checking
+out something unexpected; dependencies fetched into the cache cannot use
+path deps that escape their checkout; and two declarations of one dep name
+pointing at different sources is an error rather than a silent race.
 
 Dependencies can be managed without hand-editing the manifest, Cargo-style:
 
