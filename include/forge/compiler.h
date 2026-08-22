@@ -63,7 +63,9 @@ int forge_compiler_depfile_path(const char *object_path, char *depfile_path,
 
 /* Builds the argv for compiling one source file to one object file. Extra
  * include directories (dependency headers) are appended after the project's
- * own include directory in the compiler's dialect. */
+ * own include directory in the compiler's dialect. A non-empty
+ * `project_version` is injected as FORGE_PROJECT_VERSION ("x.y.z") into every
+ * C/C++ translation unit (assembly is left untouched). */
 int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      ForgeSourceLanguage language,
                                      const char *source_path,
@@ -73,6 +75,7 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      const char *target_arch,
                                      const ForgeBuildProfile *profile,
                                      const ForgeStringList *extra_include_dirs,
+                                     const char *project_version,
                                      ForgeArgv *argv,
                                      char *error, size_t error_size);
 

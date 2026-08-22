@@ -20,7 +20,7 @@ static void print_usage(FILE *stream)
             "  forge test [--release] [--jobs N] [--test NAME] [--manifest PATH]\n"
             "  forge debug [--release] [--jobs N] [--manifest PATH]\n"
             "  forge clean [--manifest PATH]\n"
-            "  forge update [NAME] [--manifest PATH]\n"
+            "  forge update [NAME] [--offline] [--manifest PATH]\n"
             "                        re-resolve deps (one, or all when NAME is omitted)\n"
             "  forge add <NAME> --git URL [--tag T | --branch B | --rev R]\n"
             "  forge add <NAME> --path DIR      [--manifest PATH]\n"
@@ -29,10 +29,19 @@ static void print_usage(FILE *stream)
             "  forge remove <NAME> [--manifest PATH]\n"
             "  forge new <NAME>      scaffold a new project directory\n"
             "  forge init            scaffold into the current directory\n"
+            "Build options (build/check/run/test/debug):\n"
+            "  -j, --jobs N          compile up to N translation units at once ('auto' restores the default)\n"
+            "  -q, --quiet           no output except errors and program output\n"
+            "  -v                    show per-file compile/link progress\n"
+            "  -vv                   also echo every compiler/linker command line\n"
+            "  --offline             resolve dependencies without network access\n"
+            "  --locked              fail rather than move a Forge.lock pin\n"
+            "  --frozen              --offline and --locked together\n"
             "Environment:\n"
             "  FORGE_HOME                    dependency cache root (default ~/.forge)\n"
             "  FORGE_DEBUGGER                debugger executable for `forge debug`\n"
             "  FORGE_ALLOW_UNSAFE_GIT=1      permit local-path/file:// git URLs\n"
+            "  NO_COLOR                      disable colored status lines\n"
             "See 'forge help <command>' for details on a single command.\n");
 }
 
@@ -60,9 +69,10 @@ static const ForgeVerbHelp VERB_HELP[] = {
       "debugger with FORGE_DEBUGGER." },
     { "clean", "forge clean [--manifest PATH]",
       "Remove the target/ artifact tree for this project." },
-    { "update", "forge update [NAME] [--manifest PATH]",
+    { "update", "forge update [NAME] [--offline] [--manifest PATH]",
       "Re-resolve dependencies: bare, every dep moves to the newest allowed "
-      "state; naming one moves only that dep past its pin." },
+      "state; naming one moves only that dep past its pin. --offline forbids "
+      "network access." },
     { "add", "forge add <NAME> (--git URL | --path DIR) "
              "[--tag T | --branch B | --rev R] [--manifest PATH]",
       "Insert a dependency into [dependencies]; git URLs must use https://, "
@@ -136,6 +146,25 @@ static void discover_manifest(const char **manifest_path, int explicit_manifest,
     }
 }
 
+/*
+ * Applies -q/-v/-vv to the console verbosity immediately (the log layer reads
+ * it globally). Returns 1 when the argument was a verbosity flag, so callers
+ * can fall through to their own options otherwise.
+ */
+static int apply_verbosity_flag(const char *argument)
+{
+    if (strcmp(argument, "-q") == 0 || strcmp(argument, "--quiet") == 0) {
+        forge_log_set_verbosity(FORGE_VERBOSITY_QUIET);
+    } else if (strcmp(argument, "-v") == 0) {
+        forge_log_set_verbosity(FORGE_VERBOSITY_VERBOSE);
+    } else if (strcmp(argument, "-vv") == 0) {
+        forge_log_set_verbosity(FORGE_VERBOSITY_VERY_VERBOSE);
+    } else {
+        return 0;
+    }
+    return 1;
+}
+
 static int command_new(int argc, char **argv)
 {
     if (argc < 3) {
@@ -184,20 +213,19 @@ static int command_manifest_only(const char *command, int argc, char **argv,
     return dispatch(manifest_path);
 }
 
-/* Shared parser for build/check/run/test/debug: profile and job flags plus
- * --manifest; run additionally accepts "-- ARGS..." for the program itself
- * and test accepts --test NAME to run a single test. */
+/* Shared parser for build/check/run/test/debug: profile, job, and policy
+ * flags plus --manifest; run additionally accepts "-- ARGS..." for the
+ * program itself and test accepts --test NAME to run a single test. */
 static int command_build_like(const char *command, int argc, char **argv)
 {
     const char *manifest_path = "Forge.toml";
     const char *program_arguments[FORGE_MAX_PROGRAM_ARGUMENTS];
+    ForgeBuildOptions options = forge_build_default_options();
     char discovered[FORGE_PATH_MAX];
     const char *test_filter = NULL;
     size_t program_argument_count = 0U;
     int accepts_program_arguments = strcmp(command, "run") == 0;
     int explicit_manifest = 0;
-    int release = 0;
-    int max_jobs = 0;
     int index;
 
     for (index = 2; index < argc; ++index) {
@@ -212,8 +240,18 @@ static int command_build_like(const char *command, int argc, char **argv)
             }
             break;
         }
+        if (apply_verbosity_flag(argv[index])) {
+            continue;
+        }
         if (strcmp(argv[index], "--release") == 0) {
-            release = 1;
+            options.release = 1;
+        } else if (strcmp(argv[index], "--offline") == 0) {
+            options.offline = 1;
+        } else if (strcmp(argv[index], "--locked") == 0) {
+            options.locked = 1;
+        } else if (strcmp(argv[index], "--frozen") == 0) {
+            options.offline = 1;
+            options.locked = 1;
         } else if (strcmp(argv[index], "--test") == 0) {
             if (strcmp(command, "test") != 0) {
                 fprintf(stderr, "forge: unsupported %s option '%s'\n",
@@ -236,7 +274,7 @@ static int command_build_like(const char *command, int argc, char **argv)
                 return 1;
             }
             ++index;
-            if (parse_jobs(argv[index], &max_jobs) != 0) {
+            if (parse_jobs(argv[index], &options.max_jobs) != 0) {
                 fprintf(stderr, "forge: '%s' expects a positive integer or 'auto'\n",
                         argv[index - 1]);
                 return 1;
@@ -250,18 +288,18 @@ static int command_build_like(const char *command, int argc, char **argv)
     discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
 
     if (strcmp(command, "build") == 0) {
-        return forge_orchestrate_build(manifest_path, release, max_jobs);
+        return forge_orchestrate_build(manifest_path, &options);
     }
     if (strcmp(command, "check") == 0) {
-        return forge_orchestrate_check(manifest_path, release, max_jobs);
+        return forge_orchestrate_check(manifest_path, &options);
     }
     if (strcmp(command, "test") == 0) {
-        return forge_orchestrate_test(manifest_path, release, max_jobs, test_filter);
+        return forge_orchestrate_test(manifest_path, &options, test_filter);
     }
     if (strcmp(command, "debug") == 0) {
-        return forge_orchestrate_debug(manifest_path, release, max_jobs);
+        return forge_orchestrate_debug(manifest_path, &options);
     }
-    return forge_orchestrate_run(manifest_path, release, max_jobs,
+    return forge_orchestrate_run(manifest_path, &options,
                                  program_arguments, program_argument_count);
 }
 
@@ -354,19 +392,34 @@ static int command_remove(int argc, char **argv)
     return forge_orchestrate_remove(manifest_path, argv[2]);
 }
 
-/* forge update [NAME] [--manifest PATH]: without NAME every dependency
- * re-resolves to the newest allowed state; with NAME only that dependency is
- * pulled past its lock pin and the rest stay quiet and offline-friendly. */
+/* forge update [NAME] [--offline] [--manifest PATH]: without NAME every
+ * dependency re-resolves to the newest allowed state; with NAME only that
+ * dependency is pulled past its lock pin and the rest stay quiet and
+ * offline-friendly. --offline keeps the re-resolution network-free; --locked
+ * and --frozen are rejected because update's whole job is rewriting pins. */
 static int command_update(int argc, char **argv)
 {
     const char *manifest_path = "Forge.toml";
     const char *only_name = NULL;
     char discovered[FORGE_PATH_MAX];
     int explicit_manifest = 0;
+    int offline = 0;
     int index;
 
     for (index = 2; index < argc; ++index) {
-        if (strcmp(argv[index], "--manifest") == 0) {
+        if (apply_verbosity_flag(argv[index])) {
+            continue;
+        }
+        if (strcmp(argv[index], "--locked") == 0 ||
+            strcmp(argv[index], "--frozen") == 0) {
+            fprintf(stderr,
+                    "forge: '%s' contradicts update, whose job is rewriting "
+                    "Forge.lock pins; use it on build/check/run/test/debug\n",
+                    argv[index]);
+            return 1;
+        } else if (strcmp(argv[index], "--offline") == 0) {
+            offline = 1;
+        } else if (strcmp(argv[index], "--manifest") == 0) {
             if (flag_value_missing("--manifest", index, argc)) {
                 return 1;
             }
@@ -384,7 +437,7 @@ static int command_update(int argc, char **argv)
         }
     }
     discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
-    return forge_orchestrate_update(manifest_path, only_name);
+    return forge_orchestrate_update(manifest_path, only_name, offline);
 }
 
 int forge_cli_main(int argc, char **argv)

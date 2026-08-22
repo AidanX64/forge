@@ -1,5 +1,6 @@
 [project]
 name = "hello"
+version = "0.1.0"
 
 [sources]
 c = ["src"]

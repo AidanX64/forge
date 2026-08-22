@@ -140,12 +140,12 @@ forge test --test alpha  # build & run only tests/alpha.c
 forge debug              # build, then launch a debugger
 forge clean              # remove the project's target/ output
 forge add mylib --git https://github.com/example/mylib
-                         # add a dependency, resolve it, and pin it
+                          # add a dependency, resolve it, and pin it
 forge add local --path ../local
 forge update mylib       # re-resolve one dep; `forge update` does all of them
 forge remove mylib       # drop the entry and its lock pin
 forge run --manifest path/to/Forge.toml
-                         # build another project without cd-ing into it
+                          # build another project without cd-ing into it
 ```
 
 Forge finds `Forge.toml` in the current directory or any parent, so you can
@@ -158,6 +158,40 @@ Try it immediately against the bundled fixture:
 cd test
 forge run --release     # prints "Hello world!"
 ```
+
+### Output style
+
+Builds talk like Cargo. Milestones are right-aligned and green on a tty:
+
+```text
+   Compiling hello v0.1.0
+    Finished release [optimized] target(s) in 0.42s
+     Running target/release/hello.exe
+Hello world!
+```
+
+A rerun with nothing to do prints only the `Finished` line. Verbosity:
+
+- `-q` — errors and program output only.
+- default — milestones; per-file detail stays in `target/logs/`.
+- `-v` — also shows per-file compile/link progress (`up-to-date:`/`source:`).
+- `-vv` — also echoes every compiler/linker command line.
+
+`NO_COLOR=1` (or piping output) disables colors; everything always lands in
+the invocation log under `target/logs/`.
+
+### Reproducible resolution flags
+
+`build`, `check`, `run`, `test`, and `debug` accept:
+
+- `--offline` — never touch the network: cached clones with valid lock pins
+  still resolve, anything else fails naming the dependency.
+- `--locked` — fail instead of moving or adding a `Forge.lock` pin (CI guard:
+  if this fails, someone forgot to commit an updated lockfile).
+- `--frozen` — both at once.
+
+`forge update` accepts `--offline` but rejects `--locked/--frozen`, since its
+whole job is rewriting pins.
 
 ## Features
 
@@ -180,7 +214,11 @@ and Clang, Forge asks the compiler to record the headers each translation
 unit pulled in (`-MMD -MF`) and compares object mtimes against both the
 source and every listed header, so touching a `.h` recompiles exactly the
 files that use it. Toolchains that emit no dependency file (MSVC, assembly
-sources) compare source mtimes only.
+sources) compare source mtimes only. On top of that, every object records a
+hash of the exact compile command in an `<obj>.cmdhash` sidecar, so editing
+`[profile.*] cflags` or bumping `[project] version` recompiles precisely the
+objects whose commands changed — and objects from older forge versions
+(without a stamp) recompile exactly once.
 
 Processes are spawned directly with an argv array (`CreateProcess` /
 `execvp`) — no shell is ever consulted, so paths and flags containing spaces
@@ -289,6 +327,9 @@ Supported fields:
 ```toml
 [project]
 name = "app"                 # required
+version = "0.1.0"            # optional: MAJOR.MINOR.PATCH (+ optional -prerelease);
+                             # shown in status lines and injected as
+                             # FORGE_PROJECT_VERSION ("0.1.0", a string macro)
 
 [sources]
 c = ["src"]                  # required: at least one of c/cpp/asm, non-empty
@@ -341,7 +382,9 @@ Debugger selection, in order: `cdb` (Windows) → `gdb` (Windows/Linux) →
 ### Verbose, readable logs
 All build/run/debug output is written to a `/target` directory.
 Logs are verbose by default and meant to be easy for a human to read,
-not just machine-parsed.
+not just machine-parsed. The terminal shows Cargo-style milestones by
+default; every per-file detail (including full command lines) still goes
+to `target/logs/` regardless of `-q/-v/-vv`.
 
 ## Scope
 
@@ -355,9 +398,13 @@ propagation), `forge test` (with a `--test NAME` filter), `forge debug`,
 `forge clean`, `forge update`, `forge new`, and `forge init` cover the host
 build loop. Path and git dependencies with lockfile pinning, Cargo-style
 `forge add`/`forge remove` verbs, lock pruning, and foreign CMake/Make
-dependencies are in place. Compiles and the final link are both incremental.
-Compiler dispatch, manifest parsing, upward manifest discovery, and
-per-invocation `target/logs` are in place.
+dependencies are in place. Compiles and the final link are both incremental,
+and flag/version changes invalidate exactly what they affect via per-object
+command stamps. The console speaks Cargo (`Compiling`/`Finished`/`Running`
+milestones, `-q/-v/-vv`, colors, timing) and dependency resolution honors
+`--offline`/`--locked`/`--frozen`. Compiler dispatch, manifest parsing with
+strict `[project] version`, upward manifest discovery, and per-invocation
+`target/logs` are in place.
 
 ## Author note 
 

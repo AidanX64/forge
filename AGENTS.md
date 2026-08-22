@@ -80,6 +80,20 @@ as possible, regardless of target OS, architecture, or toolchain.
 - Subcommands: `build`, `check`, `run`, `test`, `debug`, `clean`, `update`,
   `new`, `init`. New ones must stay Cargo-like verbs and compose with
   `forge <verb> --release`.
+- Build-style verbs share one options struct (`ForgeBuildOptions` in
+  `include/forge/build.h`): release/max_jobs/offline/locked. Thread new
+  build-affecting flags through it instead of growing positional params.
+- `-q/-v/-vv` map onto `ForgeVerbosity` (log.c); milestone lines go through
+  `forge_log_status`, per-file detail through `forge_logger_detail`,
+  command echoes through `forge_logger_command`. The `target/logs/` file
+  always receives everything — only the terminal is filtered.
+- `--offline` forbids network in dependency resolution; `--locked` refuses to
+  change any Forge.lock pin; `--frozen` is both. `forge update` accepts
+  `--offline` but must reject `--locked/--frozen` (its job is rewriting pins).
+- `[project] version = "MAJOR.MINOR.PATCH"` is validated strictly and
+  injected as a quoted-string macro `FORGE_PROJECT_VERSION`; changing it — or
+  any `[profile.*] cflags` entry — invalidates objects via the
+  `<obj>.cmdhash` sidecars, so never "optimize away" the command-hash check.
 - `forge run -- ARGS...` passes ARGS to the program and propagates its exit
   code; keep that contract for anything that spawns user programs.
 - `forge test` builds each `tests/*.c` as a self-contained binary (own
@@ -92,13 +106,17 @@ as possible, regardless of target OS, architecture, or toolchain.
 ### Incremental-build caveats
 - Objects are skipped when the source and every header the compiler recorded
   (`-MMD -MF` depfiles, `target/{debug,release}/obj/*.d`) are older than the
-  object. Editing a `.h` recompiles only the translation units that include it.
-- Objects built by an older forge have no depfile and recompile exactly once.
+  object AND the recorded compile-command hash matches the current one
+  (`<obj>.cmdhash`). Editing a `.h` recompiles only the translation units
+  that include it; editing profile cflags or the project version recompiles
+  exactly the objects whose command changed.
+- Objects built by an older forge have no depfile/cmdhash stamp and recompile
+  exactly once.
 - If an incremental run ever looks wrong, force a clean build first
   (`forge clean`, or `rm -rf build target test/target`).
-- MSVC and assembly sources have no header tracking (source mtime only);
-  MSVC is untestable on this machine, so the gcc fallback is what tests and
-  CI cover.
+- MSVC and assembly sources have no header tracking (source mtime + command
+  hash only); MSVC is untestable on this machine, so the gcc fallback is what
+  tests and CI cover.
 
 ### Diagnostics
 - Everything lands in `target/logs/`, and a failed stage also prints its last

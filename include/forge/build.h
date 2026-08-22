@@ -16,6 +16,20 @@ typedef enum ForgeBuildMode {
     FORGE_BUILD_MODE_DEP_OBJECTS
 } ForgeBuildMode;
 
+/*
+ * Invocation settings shared by every build-style command, threaded from the
+ * CLI through the orchestrators into the engine and dependency resolution.
+ */
+typedef struct ForgeBuildOptions {
+    int release;  /* build the [profile.release] variant */
+    int max_jobs; /* compile parallelism; 0 = one job per logical processor */
+    int offline;  /* --offline: resolving dependencies must not use network */
+    int locked;   /* --locked: resolution must not change any Forge.lock pin */
+} ForgeBuildOptions;
+
+/* Defaults for a plain `forge build`-style invocation (debug, auto jobs). */
+ForgeBuildOptions forge_build_default_options(void);
+
 /* The build engine operates on a parsed manifest and an invocation logger. */
 void forge_build_set_logger(ForgeLogger *logger);
 int forge_build_project_root(const char *manifest_path, char *root, size_t root_size);
@@ -33,7 +47,7 @@ int forge_build_project_root(const char *manifest_path, char *root, size_t root_
  */
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
                         const char *manifest_path,
-                        ForgeBuildMode mode, int release, int max_jobs,
+                        ForgeBuildMode mode, const ForgeBuildOptions *options,
                         const char *const *program_arguments,
                         size_t program_argument_count,
                         char *built_executable, size_t built_executable_size,
@@ -48,6 +62,6 @@ int forge_build_clean(const char *manifest_path);
  */
 int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
                       const char *manifest_path,
-                      int release, int max_jobs, const char *test_filter);
+                      const ForgeBuildOptions *options, const char *test_filter);
 
 #endif

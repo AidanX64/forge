@@ -432,6 +432,18 @@ static int list_contains(const ForgeStringList *list, const char *value)
     return 0;
 }
 
+/* Copies " v1.2.3" into `buffer` when the manifest declares a version, else
+ * leaves it empty — the suffix appended to every Compiling/Checking line. */
+static void version_suffix(const ForgeManifest *manifest, char *buffer,
+                           size_t buffer_size)
+{
+    if (manifest != NULL && manifest->project_version[0] != '\0') {
+        (void)snprintf(buffer, buffer_size, " v%s", manifest->project_version);
+    } else {
+        buffer[0] = '\0';
+    }
+}
+
 static int select_host_target(const ForgeManifest *manifest, const ForgeHostInfo *host,
                               const char **target_os, const char **target_arch)
 {
@@ -471,9 +483,10 @@ static int write_object_list_body(void *user_data, FILE *file)
 
 /*
  * True when `child` belongs to the current build's live object set: either a
- * listed object itself or its depfile twin (`<hash>.o` <-> `<hash>.d`) —
- * depfiles are never in the object list, and deleting them would force a
- * full recompile on every build.
+ * listed object itself or one of its twins — the `-MF` depfile
+ * (`<hash>.o` <-> `<hash>.d`) and the compile-command stamp
+ * (`<hash>.o.cmdhash`). Twins are never in the object list, but deleting one
+ * would force a pointless recompile on every later build.
  */
 static int object_artifact_is_used(const char *child,
                                    char (*used_paths)[FORGE_PATH_MAX],
@@ -489,15 +502,26 @@ static int object_artifact_is_used(const char *child,
             return 1;
         }
     }
-    if (!forge_util_has_suffix(child, ".d")) {
+    if (forge_util_has_suffix(child, ".d")) {
+        if (length + 1U >= sizeof(object_spelling)) {
+            return 0;
+        }
+        (void)snprintf(object_spelling, sizeof(object_spelling), "%s", child);
+        object_spelling[length - 1U] = 'o'; /* ".d" -> ".o" */
+        twin = object_spelling;
+    } else if (forge_util_has_suffix(child, ".cmdhash")) {
+        size_t base_length = length - 8U; /* strlen(".cmdhash") */
+
+        if (base_length == 0U || base_length + 1U > sizeof(object_spelling)) {
+            return 0;
+        }
+        memcpy(object_spelling, child, base_length);
+        object_spelling[base_length] = '\0';
+        twin = object_spelling;
+    }
+    if (twin == NULL) {
         return 0;
     }
-    if (length + 1U >= sizeof(object_spelling)) {
-        return 0;
-    }
-    (void)snprintf(object_spelling, sizeof(object_spelling), "%s", child);
-    object_spelling[length - 1U] = 'o'; /* ".d" -> ".o" */
-    twin = object_spelling;
     for (index = 0U; index < used_count; ++index) {
         if (strcmp(used_paths[index], twin) == 0) {
             return 1;
@@ -542,6 +566,7 @@ static void remove_orphan_objects(const char *directory,
         int is_artifact =
             forge_util_has_suffix(entry.cFileName, ".o") ||
             forge_util_has_suffix(entry.cFileName, ".d") ||
+            forge_util_has_suffix(entry.cFileName, ".cmdhash") ||
             forge_util_has_suffix(entry.cFileName, ".obj");
 
         if (!is_artifact ||
@@ -564,7 +589,8 @@ static void remove_orphan_objects(const char *directory,
         char child[FORGE_PATH_MAX];
         int is_artifact =
             forge_util_has_suffix(entry->d_name, ".o") ||
-            forge_util_has_suffix(entry->d_name, ".d");
+            forge_util_has_suffix(entry->d_name, ".d") ||
+            forge_util_has_suffix(entry->d_name, ".cmdhash");
 
         if (!is_artifact ||
             forge_paths_join(child, sizeof(child), directory,
@@ -579,8 +605,8 @@ static void remove_orphan_objects(const char *directory,
     (void)closedir(stream);
 #endif
     if (removed != 0U) {
-        forge_logger_log(active_logger, "compile",
-                         "removed %zu orphaned object file(s)", removed);
+        forge_logger_detail(active_logger, "compile",
+                            "removed %zu orphaned object file(s)", removed);
     }
 }
 
@@ -589,8 +615,14 @@ typedef struct ForgeCompileContext {
     const ForgeBuildProfile *profile;
     const ForgeSourceList *sources;
     const ForgeStringList *extra_include_dirs;
+    const char *project_version;
     char (*object_paths)[FORGE_PATH_MAX];
     const char **object_references;
+    /* Per-source compile commands prepared before the pool starts (freshness
+     * needs the command hash); owned by the pipeline, read-only for workers. */
+    ForgeArgv *commands;
+    char **command_displays;
+    unsigned int *command_hashes;
     const char *project_root;
     const char *target_os;
     const char *target_arch;
@@ -607,18 +639,38 @@ typedef struct ForgeCompileContext {
     ForgeMutex log_mutex;
 } ForgeCompileContext;
 
-static void compile_log(ForgeCompileContext *context, const char *stage,
-                        const char *format, ...)
+static void compile_message(ForgeCompileContext *context,
+                            void (*emit)(ForgeLogger *, const char *,
+                                         const char *, ...),
+                            const char *stage, const char *format,
+                            va_list arguments)
 {
-    va_list arguments;
     char message[FORGE_COMMAND_MAX];
 
-    va_start(arguments, format);
     (void)vsnprintf(message, sizeof(message), format, arguments);
-    va_end(arguments);
     forge_mutex_lock(&context->log_mutex);
-    forge_logger_log(active_logger, stage, "%s", message);
+    emit(active_logger, stage, "%s", message);
     forge_mutex_unlock(&context->log_mutex);
+}
+
+static void compile_detail(ForgeCompileContext *context, const char *stage,
+                           const char *format, ...)
+{
+    va_list arguments;
+
+    va_start(arguments, format);
+    compile_message(context, forge_logger_detail, stage, format, arguments);
+    va_end(arguments);
+}
+
+static void compile_command_line(ForgeCompileContext *context, const char *stage,
+                                 const char *format, ...)
+{
+    va_list arguments;
+
+    va_start(arguments, format);
+    compile_message(context, forge_logger_command, stage, format, arguments);
+    va_end(arguments);
 }
 
 static void compile_fail(ForgeCompileContext *context, const char *message)
@@ -646,47 +698,39 @@ static void compile_source_job(ForgeCompileContext *context, size_t source_index
 {
     const char *source_path = context->sources->items[source_index].path;
     const char *object_path = context->object_paths[source_index];
-    ForgeArgv argv = {0};
-    char display[FORGE_COMMAND_MAX];
+    const ForgeArgv *command = &context->commands[source_index];
+    const char *display = context->command_displays[source_index];
+    unsigned int command_hash = context->command_hashes[source_index];
     char error[FORGE_COMMAND_MAX] = {0};
     int exit_code;
     int track_headers;
 
     track_headers = context->compiler->kind != FORGE_COMPILER_MSVC &&
                     context->sources->items[source_index].language != FORGE_SOURCE_ASM;
-    if (forge_fingerprint_object_fresh(object_path, source_path, track_headers)) {
-        compile_log(context, "compile", "up-to-date: %s", source_path);
+    if (forge_fingerprint_object_fresh(object_path, source_path, track_headers,
+                                       command_hash)) {
+        compile_detail(context, "compile", "up-to-date: %s", source_path);
         context->object_references[source_index] = object_path;
         compile_count(context, 1);
         return;
     }
-    if (forge_compiler_make_compile_argv(context->compiler,
-                                         context->sources->items[source_index].language,
-                                         source_path, object_path, context->project_root,
-                                         context->target_os, context->target_arch,
-                                         context->profile, context->extra_include_dirs,
-                                         &argv, error, sizeof(error)) != 0) {
-        compile_fail(context, error);
-        return;
+    compile_detail(context, "compile", "source: %s", source_path);
+    if (display != NULL) {
+        compile_command_line(context, "compile", "command: %s", display);
     }
-    compile_log(context, "compile", "source: %s", source_path);
-    (void)forge_argv_finalize(&argv);
-    if (forge_argv_join(display, sizeof(display), &argv) == 0) {
-        compile_log(context, "compile", "command: %s", display);
-    }
-    if (forge_process_run(argv.items, log_capture_path(), 1,
+    if (forge_process_run(command->items, log_capture_path(), 1,
                           &exit_code, error, sizeof(error)) != 0) {
-        forge_argv_free(&argv);
         compile_fail(context, error);
         return;
     }
-    forge_argv_free(&argv);
     if (exit_code != 0) {
         char message[FORGE_COMMAND_MAX];
         (void)snprintf(message, sizeof(message), "compiler failed for %s", source_path);
         compile_fail(context, message);
         return;
     }
+    /* Record what this object was built from so the next run can trust it. */
+    forge_fingerprint_record_command(object_path, command_hash);
     context->object_references[source_index] = object_path;
     compile_count(context, 0);
 }
@@ -755,6 +799,49 @@ static int run_compile_pool(ForgeCompileContext *context, int max_jobs)
 }
 
 /*
+ * Emits the cargo-style end-of-build milestone. The tag mirrors cargo's
+ * "[optimized]": a release profile counts as optimized when it leaves the
+ * optimizer at its default or sets level 2+ itself (including through a raw
+ * "-O2" style flag); everything else reports as dev.
+ */
+static int profile_is_optimized(const ForgeBuildProfile *profile, int release)
+{
+    size_t index;
+
+    if (!release) {
+        return 0;
+    }
+    if (profile == NULL) {
+        return 0;
+    }
+    if (profile->opt_level < 0 || profile->opt_level >= 2) {
+        return 1;
+    }
+    for (index = 0U; index < profile->cflags.count; ++index) {
+        const char *flag = profile->cflags.items[index];
+
+        if (strncmp(flag, "-O", 2U) == 0 &&
+            strcmp(flag, "-O0") != 0 && strcmp(flag, "-O1") != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void report_finished(const ForgeManifest *manifest, int release,
+                            double started)
+{
+    forge_log_status("Finished", "%s %s target(s) in %.2fs",
+                     release ? "release" : "debug",
+                     profile_is_optimized(release ? &manifest->release_profile
+                                                  : &manifest->debug_profile,
+                                          release)
+                         ? "[optimized]"
+                         : "[dev]",
+                     forge_log_monotonic_seconds() - started);
+}
+
+/*
  * The shared build pipeline behind every compile/link/run style command.
  * `sources_override` (a shallow list, never owned) replaces manifest source
  * discovery so the test runner can build one binary per test file, and
@@ -766,7 +853,7 @@ static int run_compile_pool(ForgeCompileContext *context, int max_jobs)
  */
 static int build_binary_inner(const char *project_root, const ForgeManifest *manifest,
                               const char *manifest_path_for_freshness,
-                              ForgeBuildMode mode, int release, int max_jobs,
+                              ForgeBuildMode mode, const ForgeBuildOptions *options,
                               const ForgeSourceList *sources_override,
                               const char *output_name_override,
                               const char *const *program_arguments,
@@ -799,6 +886,7 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     char (*object_paths)[FORGE_PATH_MAX] = NULL;
     char (*used_object_names)[FORGE_PATH_MAX] = NULL;
     const char **object_references = NULL;
+    ForgeBuildOptions fallback_options;
     size_t source_index;
     size_t argument_index;
     size_t used_count = 0U;
@@ -806,6 +894,21 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     int used_response_file = 0;
     int exit_code;
     int result = -1;
+    /* Set by the command-prep pass; a fully fresh object set keeps the
+     * Compiling milestone off (cargo prints only `Finished` then). */
+    int all_objects_fresh = 1;
+    /* Milestone timing: the Finished line reports total wall time. */
+    double started = forge_log_monotonic_seconds();
+    int release;
+    int max_jobs;
+
+    if (options == NULL) {
+        /* Defensive default so internal callers never need to synthesize one */
+        fallback_options = forge_build_default_options();
+        options = &fallback_options;
+    }
+    release = options->release;
+    max_jobs = options->max_jobs;
 
     if (child_exit_code != NULL) {
         *child_exit_code = 0;
@@ -840,8 +943,10 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
      * project's own sources compile: their headers feed the compile lines
      * and their objects/libraries the link line. */
     if (resolve_dependencies && manifest->dependencies.count > 0U) {
-        if (forge_deps_resolve(project_root, manifest, 0, NULL, &dep_graph,
-                               active_logger, error, sizeof(error)) != 0) {
+        if (forge_deps_resolve(project_root, manifest, 0, NULL,
+                               options->offline, options->locked,
+                               &dep_graph, active_logger,
+                               error, sizeof(error)) != 0) {
             print_error("%s", error);
             goto cleanup;
         }
@@ -854,12 +959,15 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
         if (mode != FORGE_BUILD_MODE_COMPILE_ONLY) {
             for (node_index = 0U; node_index < dep_graph.count; ++node_index) {
                 ForgeDepNode *node = &dep_graph.nodes[node_index];
+                char suffix[FORGE_MANIFEST_VALUE_MAX + 8U];
 
+                version_suffix(node->manifest, suffix, sizeof(suffix));
+                forge_log_status("Compiling", "%s%s", node->name, suffix);
                 if (node->is_native) {
                     if (build_binary_inner(node->root, node->manifest,
                                            NULL,
-                                           FORGE_BUILD_MODE_DEP_OBJECTS, release,
-                                           max_jobs, NULL, NULL, NULL, 0U,
+                                           FORGE_BUILD_MODE_DEP_OBJECTS, options,
+                                           NULL, NULL, NULL, 0U,
                                            node->link_artifact,
                                            sizeof(node->link_artifact),
                                            NULL, 0) != 0) {
@@ -922,13 +1030,13 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
         goto cleanup;
     }
 
-    forge_logger_log(active_logger, "dispatch", "host=%s version=%s target=%s/%s",
-                     host.os_name, host.version, target_os, target_arch);
-    forge_logger_log(active_logger, "dispatch", "%s (%s)", compiler.selection_note,
-                     forge_compiler_kind_name(compiler.kind));
+    forge_logger_detail(active_logger, "dispatch", "host=%s version=%s target=%s/%s",
+                        host.os_name, host.version, target_os, target_arch);
+    forge_logger_detail(active_logger, "dispatch", "%s (%s)", compiler.selection_note,
+                        forge_compiler_kind_name(compiler.kind));
     if (compiler.kind == FORGE_COMPILER_MSVC) {
-        forge_logger_log(active_logger, "dispatch",
-                         "MSVC writes no dependency files; header edits will not trigger recompiles");
+        forge_logger_detail(active_logger, "dispatch",
+                            "MSVC writes no dependency files; header edits will not trigger recompiles");
     }
 
     for (source_index = 0U; source_index < sources.count; ++source_index) {
@@ -945,12 +1053,11 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
         ++used_count;
     }
 
-    forge_logger_log(active_logger, "compile", "----- compile %zu source file(s) with %d job(s) -----",
-                     sources.count, max_jobs <= 0 ? forge_thread_processor_count() : max_jobs);
     context.compiler = &compiler;
     context.profile = profile;
     context.sources = &sources;
     context.extra_include_dirs = have_deps ? &dep_includes : NULL;
+    context.project_version = manifest->project_version;
     context.object_paths = object_paths;
     context.object_references = object_references;
     context.project_root = project_root;
@@ -958,6 +1065,75 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     context.target_arch = target_arch;
     context.count = sources.count;
     context.next = 0U;
+
+    /*
+     * Prepare every translation unit's command line up front: the freshness
+     * check needs the command hash, and knowing whether anything will
+     * compile before the milestone prints is what keeps a fully up-to-date
+     * rerun quiet (cargo parity — only `Finished` on a no-op build).
+     */
+    if (context.count != 0U) {
+        context.commands = calloc(context.count, sizeof(*context.commands));
+        context.command_displays = calloc(context.count,
+                                          sizeof(*context.command_displays));
+        context.command_hashes = calloc(context.count, sizeof(*context.command_hashes));
+        if (context.commands == NULL || context.command_displays == NULL ||
+            context.command_hashes == NULL) {
+            print_error("out of memory while preparing compile commands");
+            goto cleanup;
+        }
+        for (source_index = 0U; source_index < context.count; ++source_index) {
+            ForgeArgv *command = &context.commands[source_index];
+            char display[FORGE_COMMAND_MAX];
+            char argv_error[FORGE_COMMAND_MAX] = {0};
+            int track_headers =
+                compiler.kind != FORGE_COMPILER_MSVC &&
+                sources.items[source_index].language != FORGE_SOURCE_ASM;
+
+            if (forge_compiler_make_compile_argv(&compiler,
+                                                 sources.items[source_index].language,
+                                                 sources.items[source_index].path,
+                                                 object_paths[source_index],
+                                                 project_root, target_os, target_arch,
+                                                 profile, context.extra_include_dirs,
+                                                 manifest->project_version,
+                                                 command, argv_error,
+                                                 sizeof(argv_error)) != 0) {
+                print_error("%s", argv_error);
+                goto cleanup;
+            }
+            (void)forge_argv_finalize(command);
+            if (forge_argv_join(display, sizeof(display), command) == 0) {
+                context.command_displays[source_index] = path_list_copy(display);
+                context.command_hashes[source_index] =
+                    forge_fingerprint_hash_text(display);
+                all_objects_fresh &= forge_fingerprint_object_fresh(
+                    object_paths[source_index], sources.items[source_index].path,
+                    track_headers, context.command_hashes[source_index]);
+            } else {
+                /* An unrepresentable command line cannot match a stamp; the
+                 * object simply recompiles every run. */
+                all_objects_fresh = 0;
+            }
+        }
+    }
+
+    if (!all_objects_fresh && mode != FORGE_BUILD_MODE_DEP_OBJECTS) {
+        /* Dependency sub-builds stay silent: the consumer's node loop
+         * already announced them. */
+        char suffix[FORGE_MANIFEST_VALUE_MAX + 8U];
+
+        version_suffix(manifest, suffix, sizeof(suffix));
+        forge_log_status(mode == FORGE_BUILD_MODE_COMPILE_ONLY ? "Checking" : "Compiling",
+                         "%s%s", output_name_override != NULL
+                                     ? output_name_override
+                                     : manifest->project_name,
+                         suffix);
+    }
+    forge_logger_detail(active_logger, "compile",
+                        "----- compile %zu source file(s) with %d job(s) -----",
+                        sources.count,
+                        max_jobs <= 0 ? forge_thread_processor_count() : max_jobs);
     if (forge_mutex_init(&context.job_mutex) != 0 ||
         forge_mutex_init(&context.log_mutex) != 0) {
         forge_mutex_destroy(&context.job_mutex);
@@ -984,8 +1160,8 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
             break;
         }
     }
-    forge_logger_log(active_logger, "compile",
-                     "compiled %zu, up-to-date %zu", context.compiled, context.skipped);
+    forge_logger_detail(active_logger, "compile",
+                        "compiled %zu, up-to-date %zu", context.compiled, context.skipped);
 
     /*
      * Sources that were renamed or deleted leave their .o/.d behind forever
@@ -995,8 +1171,9 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     remove_orphan_objects(object_directory, object_paths, sources.count);
 
     if (mode == FORGE_BUILD_MODE_COMPILE_ONLY) {
-        forge_logger_log(active_logger, "check",
-                         "check: all %zu translation unit(s) compiled", sources.count);
+        forge_logger_detail(active_logger, "check",
+                            "check: all %zu translation unit(s) compiled", sources.count);
+        report_finished(manifest, release, started);
         result = 0;
         goto cleanup;
     }
@@ -1072,7 +1249,7 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                               &executable_stat);
         if (fresh) {
             text_builder_free(&expected_stamp);
-            forge_logger_log(active_logger, "link", "up-to-date: %s", executable_path);
+            forge_logger_detail(active_logger, "link", "up-to-date: %s", executable_path);
             if (built_executable != NULL && built_executable_size != 0U) {
                 if (snprintf(built_executable, built_executable_size, "%s",
                              executable_path) < 0 ||
@@ -1081,6 +1258,7 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                     goto cleanup;
                 }
             }
+            report_finished(manifest, release, started);
             if (mode != FORGE_BUILD_MODE_RUN) {
                 result = 0;
                 goto cleanup;
@@ -1099,15 +1277,15 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
             print_error("%s", error);
             goto cleanup;
         }
-        forge_logger_log(active_logger, "link", "----- link %s -----", executable_path);
+        forge_logger_detail(active_logger, "link", "----- link %s -----", executable_path);
         (void)forge_argv_finalize(&argv);
         if (forge_argv_join(display, sizeof(display), &argv) == 0) {
-            forge_logger_log(active_logger, "link", "command: %s", display);
+            forge_logger_command(active_logger, "link", "command: %s", display);
         }
         if (used_response_file) {
-            forge_logger_log(active_logger, "link",
-                             "long link line: objects and flags spilled to %s/link.rsp",
-                             profile_directory);
+            forge_logger_detail(active_logger, "link",
+                                "long link line: objects and flags spilled to %s/link.rsp",
+                                profile_directory);
         }
         exit_code = 0;
         if (forge_process_run(argv.items, log_capture_path(), 1,
@@ -1132,13 +1310,15 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
             goto cleanup;
         }
     }
+    report_finished(manifest, release, started);
     if (mode != FORGE_BUILD_MODE_RUN) {
         result = 0;
         goto cleanup;
     }
 
 run_phase:
-    forge_logger_log(active_logger, "run", "----- run %s -----", executable_path);
+    forge_log_status("Running", "%s", executable_path);
+    forge_logger_detail(active_logger, "run", "----- run %s -----", executable_path);
     argv = (ForgeArgv){0};
     if (forge_argv_append(&argv, executable_path) != 0) {
         print_error("out of memory while preparing run command");
@@ -1152,7 +1332,7 @@ run_phase:
     }
     (void)forge_argv_finalize(&argv);
     if (forge_argv_join(display, sizeof(display), &argv) == 0) {
-        forge_logger_log(active_logger, "run", "program: %s", display);
+        forge_logger_command(active_logger, "run", "program: %s", display);
     }
     exit_code = 0;
     if (forge_process_run(argv.items, NULL, 0, &exit_code, error, sizeof(error)) != 0) {
@@ -1165,14 +1345,24 @@ run_phase:
         *child_exit_code = exit_code;
     }
     /* A failing program is not a failing build pipeline; callers decide what
-     * the child's code means (forge run propagates it, forge test records it). */
+     * the child's code means (forge run propagates it, forge test records it).
+     * The nonzero exit is surfaced on the terminal even at -q, where the
+     * program's own output would otherwise be the only clue. */
     if (exit_code != 0) {
-        forge_logger_log(active_logger, "run", "exit: %d", exit_code);
+        forge_logger_error(active_logger, "run", "exit: %d", exit_code);
     }
     result = 0;
 
 cleanup:
     forge_argv_free(&argv);
+    if (context.commands != NULL) {
+        for (source_index = 0U; source_index < context.count; ++source_index) {
+            forge_argv_free(&context.commands[source_index]);
+        }
+    }
+    free(context.commands);
+    free(context.command_displays);
+    free(context.command_hashes);
     free(object_references);
     free(used_object_names);
     free(object_paths);
@@ -1184,16 +1374,27 @@ cleanup:
     return result;
 }
 
+ForgeBuildOptions forge_build_default_options(void)
+{
+    ForgeBuildOptions options;
+
+    options.release = 0;
+    options.max_jobs = 0;
+    options.offline = 0;
+    options.locked = 0;
+    return options;
+}
+
 int forge_build_project(const char *project_root, const ForgeManifest *manifest,
                         const char *manifest_path,
-                        ForgeBuildMode mode, int release, int max_jobs,
+                        ForgeBuildMode mode, const ForgeBuildOptions *options,
                         const char *const *program_arguments,
                         size_t program_argument_count,
                         char *built_executable, size_t built_executable_size,
                         int *child_exit_code)
 {
-    return build_binary_inner(project_root, manifest, manifest_path, mode, release,
-                              max_jobs, NULL, NULL, program_arguments,
+    return build_binary_inner(project_root, manifest, manifest_path, mode, options,
+                              NULL, NULL, program_arguments,
                               program_argument_count, built_executable,
                               built_executable_size, child_exit_code, 1);
 }
@@ -1236,7 +1437,7 @@ static void test_binary_name(const char *path, char *output, size_t output_size)
  */
 int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
                       const char *manifest_path,
-                      int release, int max_jobs, const char *test_filter)
+                      const ForgeBuildOptions *options, const char *test_filter)
 {
     ForgeManifest test_manifest = *manifest;
     ForgeSourceList tests = {0};
@@ -1255,8 +1456,8 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
     }
     /* No tests/ directory is a normal state, not an error. */
     if (stat(tests_directory, &details) != 0 || !S_ISDIR(details.st_mode)) {
-        forge_logger_log(active_logger, "test",
-                         "no tests found in tests/ (create tests/*.c with their own main)");
+        forge_logger_detail(active_logger, "test",
+                            "no tests found in tests/ (create tests/*.c with their own main)");
         return 0;
     }
     /* All three language buckets point at tests/ so each collected file is
@@ -1276,8 +1477,8 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
         return -1;
     }
     if (tests.count == 0U) {
-        forge_logger_log(active_logger, "test",
-                         "no tests found in tests/ (create tests/*.c with their own main)");
+        forge_logger_detail(active_logger, "test",
+                            "no tests found in tests/ (create tests/*.c with their own main)");
         forge_sources_free(&tests);
         return 0;
     }
@@ -1296,11 +1497,12 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
         single.items = &tests.items[index];
         single.count = 1U;
         single.capacity = 0U;
-        forge_logger_log(active_logger, "test", "----- test %s (%s) -----",
-                         name, tests.items[index].path);
+        forge_log_status("Running", "test %s (%s)", name, tests.items[index].path);
+        forge_logger_detail(active_logger, "test", "----- test %s (%s) -----",
+                            name, tests.items[index].path);
         status = build_binary_inner(project_root, manifest, manifest_path,
-                                    FORGE_BUILD_MODE_RUN, release,
-                                    max_jobs, &single, name, NULL, 0U, NULL, 0U,
+                                    FORGE_BUILD_MODE_RUN, options,
+                                    &single, name, NULL, 0U, NULL, 0U,
                                     &child_exit_code, 1);
         if (status != 0) {
             ++failed;
@@ -1309,11 +1511,11 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
         }
         if (child_exit_code == 0) {
             ++passed;
-            forge_logger_log(active_logger, "test", "passed: %s", name);
+            forge_logger_detail(active_logger, "test", "passed: %s", name);
         } else {
             ++failed;
-            forge_logger_log(active_logger, "test", "failed: %s (exit %d)",
-                             name, child_exit_code);
+            forge_logger_error(active_logger, "test", "failed: %s (exit %d)",
+                               name, child_exit_code);
         }
     }
     forge_sources_free(&tests);
@@ -1324,8 +1526,9 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
                            test_filter);
         return -1;
     }
-    forge_logger_log(active_logger, "test", "test result: %zu passed; %zu failed",
-                     passed, failed);
+    forge_log_status("Test result", "%zu passed; %zu failed", passed, failed);
+    forge_logger_detail(active_logger, "test", "test result: %zu passed; %zu failed",
+                        passed, failed);
     return failed == 0U ? 0 : 1;
 }
 

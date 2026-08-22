@@ -12,6 +12,7 @@
 static const char *MANIFEST_TEMPLATE =
     "[project]\n"
     "name = \"%s\"\n"
+    "version = \"0.1.0\"\n"
     "\n"
     "[sources]\n"
     "c = [\"src\"]\n"

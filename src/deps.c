@@ -435,10 +435,13 @@ static void discard_cache_dir(const char *cache_dir)
  * When `locked_commit` is non-empty and no update was forced, the fetch is
  * skipped entirely so offline rebuilds stay quiet and fast. With
  * `submodules` set, submodules are cloned/updated alongside every checkout.
+ * `offline` (from --offline) forbids every network step: a cached clone with
+ * a matching lock pin still checks out locally, anything else fails here,
+ * before git can run.
  */
 static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char *url,
                                const char *ref, const char *locked_commit,
-                               int force_update, int submodules,
+                               int force_update, int submodules, int offline,
                                const char *cache_dir,
                                char *resolved_sha, size_t resolved_sha_size,
                                char *error, size_t error_size)
@@ -471,6 +474,21 @@ static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char
         return -1;
     }
     have_ref = ref[0] != '\0';
+
+    /*
+     * The offline contract: only the fully-local path survives. That needs a
+     * warm cache AND a lock pin matching the manifest's url/ref — anything
+     * else would require clone/fetch, which --offline refuses up front so
+     * the message names the policy instead of surfacing a git network error.
+     */
+    if (offline && !use_locked) {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s' cannot be resolved offline; it has no lock "
+                  "pin matching the manifest (or an update was forced). "
+                  "Rerun without --offline once to fetch it",
+                  name);
+        return -1;
+    }
 
     /*
      * A directory without a .git entry is not a usable clone (an interrupted
@@ -549,8 +567,16 @@ static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char
                  * The locked commit may simply not exist in this local clone yet
                  * (the cache was cloned while a different ref was checked out).
                  * Fetch once and retry before giving up so offline-capable
-                 * rebuilds still recover online.
+                 * rebuilds still recover online — but only when network is
+                 * allowed; --offline reports the missing commit instead.
                  */
+                if (offline) {
+                    forge_util_set_error(error, error_size,
+                              "dependency '%s': locked commit %s is not in the "
+                              "local cache and --offline forbids fetching it",
+                              name, locked_commit);
+                    return -1;
+                }
                 recovered = git_run(logger, cache_dir, fetch_arguments, NULL, 0,
                                     error, error_size) == 0 &&
                             git_run(logger, cache_dir, checkout_arguments, NULL, 0,
@@ -791,6 +817,9 @@ typedef struct ForgeResolveContext {
     ForgeLockFile lock;
     int lock_dirty;
     int force_update;
+    /* --offline / --locked policies from the CLI (see forge_deps_resolve). */
+    int offline;
+    int locked;
     /* When non-empty, only this dependency is re-resolved past its lock pin
      * (`forge update <name>`); every other dep keeps its locked commit. */
     char force_update_name[FORGE_MANIFEST_VALUE_MAX];
@@ -1239,7 +1268,8 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                     strcmp(locked->url, dependency->git_url) == 0 &&
                     strcmp(locked->ref, dependency->ref) == 0 ?
                         locked->commit : "",
-                    dep_force, dependency->submodules, cache_dir,
+                    dep_force, dependency->submodules, context->offline,
+                    cache_dir,
                     resolved_sha, sizeof(resolved_sha),
                     context->error, sizeof(context->error));
                 cache_gate_release(&gate);
@@ -1367,6 +1397,7 @@ static void prune_lock_entries(ForgeLockFile *lock, const ForgeDepGraph *graph,
 
 int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
                        int force_update, const char *force_update_name,
+                       int offline, int locked,
                        ForgeDepGraph *graph, ForgeLogger *logger,
                        char *error, size_t error_size)
 {
@@ -1383,6 +1414,8 @@ int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
     memset(&context, 0, sizeof(context));
     context.project_root = project_root;
     context.force_update = force_update;
+    context.offline = offline;
+    context.locked = locked;
     if (force_update_name != NULL) {
         (void)snprintf(context.force_update_name,
                        sizeof(context.force_update_name), "%s", force_update_name);
@@ -1403,6 +1436,13 @@ int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
      */
     if (manifest->dependencies.count == 0U) {
         if (context.lock.count != 0U) {
+            if (locked) {
+                forge_util_set_error(error, error_size,
+                          "--locked forbids changing Forge.lock but it lists "
+                          "dependencies that are no longer declared; rerun "
+                          "without --locked to prune them");
+                return -1;
+            }
             context.lock.count = 0U;
             if (save_lockfile(context.lock_path, &context.lock, error, error_size) != 0) {
                 return -1;
@@ -1416,15 +1456,26 @@ int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
     } else {
         dirty = 0;
     }
-    if (status == 0 && (context.lock_dirty || dirty || !context.lock.exists)) {
-        if (save_lockfile(context.lock_path, &context.lock, error, error_size) != 0) {
-            status = -1;
-        }
-    }
     if (status != 0) {
         (void)snprintf(error, error_size, "%s", context.error);
+        return status;
     }
-    return status;
+    if (locked && (context.lock_dirty || dirty)) {
+        /* --locked promises the resolution leaves every pin exactly as
+         * committed; a moved/added/pruned pin means the caller is out of
+         * sync with the manifest. */
+        forge_util_set_error(error, error_size,
+                  "--locked forbids changing Forge.lock but this resolution "
+                  "needs to update a pin; rerun without --locked (or `forge "
+                  "update`) and commit the result");
+        return -1;
+    }
+    if (context.lock_dirty || dirty || !context.lock.exists) {
+        if (save_lockfile(context.lock_path, &context.lock, error, error_size) != 0) {
+            return -1;
+        }
+    }
+    return 0;
 }
 
 void forge_deps_free_graph(ForgeDepGraph *graph)

@@ -42,6 +42,7 @@ typedef struct ForgeProfileSeen {
 
 typedef struct ForgeManifestSeen {
     int project_name;
+    int project_version;
     int source_c;
     int source_cpp;
     int source_asm;
@@ -285,6 +286,59 @@ static int dependency_name_is_valid(const char *name)
         }
     }
     return name[0] != '\0';
+}
+
+/*
+ * Versions follow the semver core shape: three numeric components without
+ * leading zeros, optionally followed by a '-' pre-release of alphanumeric,
+ * hyphen, or dot characters ("1.2.3", "1.2.3-rc.1"). Strictness here means
+ * the version can be embedded as a C string literal and later sorted or
+ * compared mechanically without edge cases.
+ */
+static int version_is_valid(const char *version)
+{
+    size_t index = 0U;
+    unsigned int component;
+
+    for (component = 0U; component < 3U; ++component) {
+        if (component > 0U) {
+            if (version[index] != '.') {
+                return 0;
+            }
+            ++index;
+        }
+        if (!isdigit((unsigned char)version[index])) {
+            return 0;
+        }
+        /* "0" alone is valid; "01" is not. */
+        if (version[index] == '0' && isdigit((unsigned char)version[index + 1U])) {
+            return 0;
+        }
+        while (isdigit((unsigned char)version[index])) {
+            ++index;
+        }
+    }
+    if (version[index] == '\0') {
+        return 1;
+    }
+    if (version[index] != '-') {
+        return 0;
+    }
+    ++index;
+    if (version[index] == '\0') {
+        return 0;
+    }
+    for (; version[index] != '\0'; ++index) {
+        unsigned char character = (unsigned char)version[index];
+
+        if (!((character >= 'a' && character <= 'z') ||
+              (character >= 'A' && character <= 'Z') ||
+              (character >= '0' && character <= '9') ||
+              character == '-' || character == '.')) {
+            return 0;
+        }
+    }
+    return 1;
 }
 
 /*
@@ -570,6 +624,25 @@ static int parse_assignment(ForgeManifestSection section, char *line,
         return reject_duplicate(&seen->project_name, key, error, error_size) ||
                parse_scalar(value, manifest->project_name, sizeof(manifest->project_name),
                             error, error_size);
+    }
+    if (section == FORGE_SECTION_PROJECT && strcmp(key, "version") == 0) {
+        char parsed[FORGE_MANIFEST_VALUE_MAX];
+
+        if (reject_duplicate(&seen->project_version, key, error, error_size) != 0) {
+            return -1;
+        }
+        if (parse_scalar(value, parsed, sizeof(parsed), error, error_size) != 0) {
+            return -1;
+        }
+        if (!version_is_valid(parsed)) {
+            forge_util_set_error(error, error_size,
+                      "version '%s' must be MAJOR.MINOR.PATCH with an optional "
+                      "-prerelease (e.g. \"1.2.3\" or \"1.2.3-rc.1\")", parsed);
+            return -1;
+        }
+        (void)snprintf(manifest->project_version,
+                       sizeof(manifest->project_version), "%s", parsed);
+        return 0;
     }
     if (section == FORGE_SECTION_SOURCES && strcmp(key, "c") == 0) {
         return reject_duplicate(&seen->source_c, key, error, error_size) ||

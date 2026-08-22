@@ -107,12 +107,12 @@ int forge_fingerprint_mtime_text(const char *path, char *text, size_t text_size)
 }
 
 /*
- * Stable FNV-1a hash of a source path. Object files are named after this hash
+ * Stable FNV-1a hash of a text blob. Object files are named after this hash
  * instead of their compile index, so adding/removing/reordering sources never
  * makes an object file "belong" to a different source than the one stored in
  * it (which an index-based scheme would allow once we skip fresh files).
  */
-static unsigned int source_hash(const char *text)
+unsigned int forge_fingerprint_hash_text(const char *text)
 {
     unsigned int hash = 2166136261U;
 
@@ -121,6 +121,68 @@ static unsigned int source_hash(const char *text)
         hash *= 16777619U;
     }
     return hash;
+}
+
+static unsigned int source_hash(const char *text)
+{
+    return forge_fingerprint_hash_text(text);
+}
+
+/*
+ * Compile-command sidecars: "<object>.cmdhash" holds the hash of the exact
+ * command line that produced the object. Freshness requires it to match, so
+ * editing [profile] cflags or bumping the project version recompiles only
+ * what those changes affect, instead of silently relinking stale objects
+ * (the failure mode before sidecars existed).
+ */
+static int command_stamp_path(const char *object_path, char *path, size_t path_size)
+{
+    size_t length = strlen(object_path);
+
+    if (length + sizeof(".cmdhash") > path_size) {
+        return -1;
+    }
+    memcpy(path, object_path, length + 1U);
+    memcpy(path + length, ".cmdhash", sizeof(".cmdhash"));
+    return 0;
+}
+
+static int command_stamp_matches(const char *object_path, unsigned int command_hash)
+{
+    char path[FORGE_PATH_MAX];
+    FILE *stream;
+    unsigned int recorded = 0U;
+    int matched;
+
+    if (command_stamp_path(object_path, path, sizeof(path)) != 0) {
+        return 0;
+    }
+    stream = fopen(path, "rb");
+    if (stream == NULL) {
+        /* Objects built by an older forge carry no stamp; they recompile
+         * exactly once — the same contract as objects without depfiles. */
+        return 0;
+    }
+    matched = fscanf(stream, "%x", &recorded) == 1 && recorded == command_hash;
+    (void)fclose(stream);
+    return matched;
+}
+
+void forge_fingerprint_record_command(const char *object_path,
+                                      unsigned int command_hash)
+{
+    char path[FORGE_PATH_MAX];
+    FILE *stream;
+
+    if (command_stamp_path(object_path, path, sizeof(path)) != 0) {
+        return;
+    }
+    stream = fopen(path, "wb");
+    if (stream == NULL) {
+        return; /* best effort: the next run simply recompiles once */
+    }
+    (void)fprintf(stream, "%08x\n", command_hash);
+    (void)fclose(stream);
 }
 
 /*
@@ -257,7 +319,7 @@ static int depfile_has_stale_dependency(FILE *stream, const char *object_path)
 }
 
 int forge_fingerprint_object_fresh(const char *object_path, const char *source_path,
-                                   int track_headers)
+                                   int track_headers, unsigned int command_hash)
 {
     char depfile_path[FORGE_PATH_MAX];
     FILE *stream;
@@ -272,6 +334,9 @@ int forge_fingerprint_object_fresh(const char *object_path, const char *source_p
     /* Equal timestamps count as fresh: an object written in the same tick as
      * its source was built from that source. */
     if (time_is_newer(&source_time, &object_time)) {
+        return 0;
+    }
+    if (!command_stamp_matches(object_path, command_hash)) {
         return 0;
     }
     if (!track_headers) {

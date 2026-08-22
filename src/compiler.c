@@ -341,6 +341,7 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
                                      const char *target_arch,
                                      const ForgeBuildProfile *profile,
                                      const ForgeStringList *extra_include_dirs,
+                                     const char *project_version,
                                      ForgeArgv *argv,
                                      char *error, size_t error_size)
 {
@@ -447,6 +448,34 @@ int forge_compiler_make_compile_argv(const ForgeCompiler *compiler,
             forge_argv_append(argv, "-o") != 0 ||
             forge_argv_append(argv, object_path) != 0) {
             forge_util_set_error(error, error_size, "out of memory while building compile command");
+            forge_argv_free(argv);
+            return -1;
+        }
+    }
+
+    /*
+     * The project version rides along as a preprocessor define so programs
+     * can report themselves (`#define FORGE_PROJECT_VERSION "1.2.3"`). The
+     * quotes are literal characters inside the argv element: on POSIX they
+     * reach the compiler verbatim, and on Windows process.c escapes them for
+     * the CreateProcess command line, so both dialects end up with a quoted
+     * string macro. Assembly is left untouched (ml64 has no use for it).
+     */
+    if (language != FORGE_SOURCE_ASM && project_version != NULL &&
+        project_version[0] != '\0') {
+        char define[FORGE_MANIFEST_VALUE_MAX + 40U];
+        const char *prefix = compiler->kind == FORGE_COMPILER_MSVC ? "/" : "-";
+
+        if ((size_t)snprintf(define, sizeof(define),
+                             "%sDFORGE_PROJECT_VERSION=\"%s\"",
+                             prefix, project_version) >= sizeof(define)) {
+            forge_util_set_error(error, error_size, "project version is too long");
+            forge_argv_free(argv);
+            return -1;
+        }
+        if (forge_argv_append(argv, define) != 0) {
+            forge_util_set_error(error, error_size,
+                                 "out of memory while building compile command");
             forge_argv_free(argv);
             return -1;
         }

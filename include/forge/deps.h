@@ -58,10 +58,15 @@ int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_s
  * rejects dependency cycles. `force_update` re-resolves refs even when the
  * lockfile already matches; when it is zero, `force_update_name` (NULL or
  * empty for "none") limits that re-resolution to the one named dependency,
- * leaving every other lock pin untouched. Returns 0 on success.
+ * leaving every other lock pin untouched. With `offline` set no network is
+ * used at all: a cached clone with a valid lock pin still resolves, anything
+ * needing clone/fetch fails with a readable error. With `locked` set a
+ * resolution that would move or add a pin fails instead of rewriting
+ * Forge.lock. Returns 0 on success.
  */
 int forge_deps_resolve(const char *project_root, const ForgeManifest *manifest,
                        int force_update, const char *force_update_name,
+                       int offline, int locked,
                        ForgeDepGraph *graph, ForgeLogger *logger,
                        char *error, size_t error_size);
 

@@ -39,6 +39,9 @@ typedef struct ForgeBuildProfile {
 
 typedef struct ForgeManifest {
     char project_name[FORGE_MANIFEST_VALUE_MAX];
+    /* "MAJOR.MINOR.PATCH" with optional "-prerelease"; empty when unset.
+     * Shown in status lines and injected as FORGE_PROJECT_VERSION. */
+    char project_version[FORGE_MANIFEST_VALUE_MAX];
     ForgeStringList c_source_dirs;
     ForgeStringList cpp_source_dirs;
     ForgeStringList asm_source_dirs;

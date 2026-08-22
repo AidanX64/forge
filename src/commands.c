@@ -24,8 +24,9 @@ static int load_invocation(const char *manifest_path, const char *kind, ForgeLog
         return -1;
     }
     forge_build_set_logger(logger);
-    forge_logger_log(logger, kind, "log: %s", logger->path);
-    forge_logger_log(logger, "parse", "----- parse manifest %s -----", manifest_path);
+    forge_log_set_session_logger(logger);
+    forge_logger_detail(logger, kind, "log: %s", logger->path);
+    forge_logger_detail(logger, "parse", "----- parse manifest %s -----", manifest_path);
     if (forge_manifest_load(manifest_path, manifest, error, sizeof(error)) != 0) {
         forge_logger_error(logger, "parse", "%s", error);
         return -1;
@@ -37,14 +38,17 @@ static void finish_invocation(ForgeLogger *logger)
 {
     forge_logger_close(logger);
     forge_build_set_logger(NULL);
+    forge_log_set_session_logger(NULL);
 }
 
-int forge_orchestrate_run(const char *manifest_path, int release, int max_jobs,
+int forge_orchestrate_run(const char *manifest_path, const ForgeBuildOptions *options,
                           const char *const *program_arguments,
                           size_t program_argument_count)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
+    ForgeBuildOptions default_options = forge_build_default_options();
+    const ForgeBuildOptions *effective = options != NULL ? options : &default_options;
     char root[FORGE_PATH_MAX];
     int child_exit_code = 0;
     int status;
@@ -54,18 +58,21 @@ int forge_orchestrate_run(const char *manifest_path, int release, int max_jobs,
         return 1;
     }
     status = forge_build_project(root, &manifest, manifest_path, FORGE_BUILD_MODE_RUN,
-                                 release, max_jobs, program_arguments,
+                                 effective, program_arguments,
                                  program_argument_count, NULL, 0U, &child_exit_code);
-    forge_logger_log(&logger, "build", "result: %s", status == 0 ? "success" : "failed");
+    forge_logger_detail(&logger, "build", "result: %s",
+                        status == 0 ? "success" : "failed");
     finish_invocation(&logger);
     /* A successful pipeline propagates the program's own exit code. */
     return status != 0 ? 1 : child_exit_code;
 }
 
-int forge_orchestrate_build(const char *manifest_path, int release, int max_jobs)
+int forge_orchestrate_build(const char *manifest_path, const ForgeBuildOptions *options)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
+    ForgeBuildOptions default_options = forge_build_default_options();
+    const ForgeBuildOptions *effective = options != NULL ? options : &default_options;
     char root[FORGE_PATH_MAX];
     char executable[FORGE_PATH_MAX];
     int result;
@@ -75,17 +82,20 @@ int forge_orchestrate_build(const char *manifest_path, int release, int max_jobs
         return 1;
     }
     result = forge_build_project(root, &manifest, manifest_path, FORGE_BUILD_MODE_LINK,
-                                 release, max_jobs, NULL, 0U, executable,
+                                 effective, NULL, 0U, executable,
                                  sizeof(executable), NULL) == 0 ? 0 : 1;
-    forge_logger_log(&logger, "build", "result: %s", result == 0 ? "success" : "failed");
+    forge_logger_detail(&logger, "build", "result: %s",
+                        result == 0 ? "success" : "failed");
     finish_invocation(&logger);
     return result;
 }
 
-int forge_orchestrate_check(const char *manifest_path, int release, int max_jobs)
+int forge_orchestrate_check(const char *manifest_path, const ForgeBuildOptions *options)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
+    ForgeBuildOptions default_options = forge_build_default_options();
+    const ForgeBuildOptions *effective = options != NULL ? options : &default_options;
     char root[FORGE_PATH_MAX];
     int result;
 
@@ -94,18 +104,21 @@ int forge_orchestrate_check(const char *manifest_path, int release, int max_jobs
         return 1;
     }
     result = forge_build_project(root, &manifest, manifest_path,
-                                 FORGE_BUILD_MODE_COMPILE_ONLY, release,
-                                 max_jobs, NULL, 0U, NULL, 0U, NULL) == 0 ? 0 : 1;
-    forge_logger_log(&logger, "check", "result: %s", result == 0 ? "success" : "failed");
+                                 FORGE_BUILD_MODE_COMPILE_ONLY, effective,
+                                 NULL, 0U, NULL, 0U, NULL) == 0 ? 0 : 1;
+    forge_logger_detail(&logger, "check", "result: %s",
+                        result == 0 ? "success" : "failed");
     finish_invocation(&logger);
     return result;
 }
 
-int forge_orchestrate_test(const char *manifest_path, int release, int max_jobs,
+int forge_orchestrate_test(const char *manifest_path, const ForgeBuildOptions *options,
                            const char *test_filter)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
+    ForgeBuildOptions default_options = forge_build_default_options();
+    const ForgeBuildOptions *effective = options != NULL ? options : &default_options;
     char root[FORGE_PATH_MAX];
     int result;
 
@@ -113,15 +126,16 @@ int forge_orchestrate_test(const char *manifest_path, int release, int max_jobs,
         finish_invocation(&logger);
         return 1;
     }
-    result = forge_build_tests(root, &manifest, manifest_path, release, max_jobs,
+    result = forge_build_tests(root, &manifest, manifest_path, effective,
                                test_filter);
-    forge_logger_log(&logger, "test", "result: %s",
-                     result == 0 ? "success" : (result < 0 ? "failed" : "tests failed"));
+    forge_logger_detail(&logger, "test", "result: %s",
+                        result == 0 ? "success" : (result < 0 ? "failed" : "tests failed"));
     finish_invocation(&logger);
     return result < 0 ? 1 : result;
 }
 
-int forge_orchestrate_update(const char *manifest_path, const char *only_name)
+int forge_orchestrate_update(const char *manifest_path, const char *only_name,
+                             int offline)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
@@ -182,7 +196,8 @@ int forge_orchestrate_update(const char *manifest_path, const char *only_name)
      * dependency alone via force_update_name.
      */
     result = forge_deps_resolve(root, &manifest, resolve_name == NULL ? 1 : 0,
-                                resolve_name != NULL ? resolve_name : "", &graph,
+                                resolve_name != NULL ? resolve_name : "",
+                                offline, 0, &graph,
                                 &logger, error, sizeof(error)) == 0 ? 0 : 1;
     if (result != 0 && error[0] != '\0') {
         forge_logger_error(&logger, "update", "%s", error);
@@ -191,15 +206,18 @@ int forge_orchestrate_update(const char *manifest_path, const char *only_name)
                          graph.count);
     }
     forge_deps_free_graph(&graph);
-    forge_logger_log(&logger, "update", "result: %s", result == 0 ? "success" : "failed");
+    forge_logger_detail(&logger, "update", "result: %s",
+                        result == 0 ? "success" : "failed");
     finish_invocation(&logger);
     return result;
 }
 
-int forge_orchestrate_debug(const char *manifest_path, int release, int max_jobs)
+int forge_orchestrate_debug(const char *manifest_path, const ForgeBuildOptions *options)
 {
     ForgeManifest manifest;
     ForgeLogger logger = {0};
+    ForgeBuildOptions default_options = forge_build_default_options();
+    const ForgeBuildOptions *effective = options != NULL ? options : &default_options;
     char error[FORGE_COMMAND_MAX] = {0};
     char root[FORGE_PATH_MAX];
     char executable[FORGE_PATH_MAX];
@@ -210,13 +228,14 @@ int forge_orchestrate_debug(const char *manifest_path, int release, int max_jobs
         return 1;
     }
     result = forge_build_project(root, &manifest, manifest_path, FORGE_BUILD_MODE_LINK,
-                                 release, max_jobs, NULL, 0U, executable,
+                                 effective, NULL, 0U, executable,
                                  sizeof(executable), NULL) == 0 &&
              forge_debug_launch(executable, &logger, error, sizeof(error)) == 0 ? 0 : 1;
     if (result != 0 && error[0] != '\0') {
         forge_logger_error(&logger, "debug", "%s", error);
     }
-    forge_logger_log(&logger, "debug", "result: %s", result == 0 ? "success" : "failed");
+    forge_logger_detail(&logger, "debug", "result: %s",
+                        result == 0 ? "success" : "failed");
     finish_invocation(&logger);
     return result;
 }
@@ -243,6 +262,7 @@ int forge_orchestrate_add(const char *manifest_path, const char *name,
         return 1;
     }
     forge_build_set_logger(&logger);
+    forge_log_set_session_logger(&logger);
     if (forge_pkg_add(manifest_path, name, git_url, ref_kind, ref_value, dep_path,
                       &logger, error, sizeof(error)) != 0) {
         forge_logger_error(&logger, "deps", "%s", error);
@@ -250,6 +270,7 @@ int forge_orchestrate_add(const char *manifest_path, const char *name,
     }
     forge_logger_close(&logger);
     forge_build_set_logger(NULL);
+    forge_log_set_session_logger(NULL);
     return result;
 }
 
@@ -268,12 +289,14 @@ int forge_orchestrate_remove(const char *manifest_path, const char *name)
         return 1;
     }
     forge_build_set_logger(&logger);
+    forge_log_set_session_logger(&logger);
     if (forge_pkg_remove(manifest_path, name, &logger, error, sizeof(error)) != 0) {
         forge_logger_error(&logger, "deps", "%s", error);
         result = 1;
     }
     forge_logger_close(&logger);
     forge_build_set_logger(NULL);
+    forge_log_set_session_logger(NULL);
     return result;
 }
 

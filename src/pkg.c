@@ -415,7 +415,7 @@ static int resolve_after_edit(const char *manifest_path, ForgeLogger *logger,
     if (forge_build_project_root(manifest_path, root, sizeof(root)) != 0) {
         return -1;
     }
-    status = forge_deps_resolve(root, &manifest, 0, NULL, &graph, logger, error,
+    status = forge_deps_resolve(root, &manifest, 0, NULL, 0, 0, &graph, logger, error,
                                 error_size);
     forge_deps_free_graph(&graph);
     return status;

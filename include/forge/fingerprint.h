@@ -22,13 +22,26 @@ int forge_fingerprint_mtime_text(const char *path, char *text, size_t text_size)
 #include "forge/paths.h"
 
 /*
- * Returns 1 when the object file is at least as new as the source and, when
- * `track_headers` is set, at least as new as every header the compiler
- * recorded via -MMD -MF; 0 when the object is missing or stale. Toolchains
- * with no dependency file (MSVC, assembly sources) compare sources only.
+ * Returns 1 when the object file is at least as new as the source, was built
+ * from the exact command described by `command_hash` (see below), and — when
+ * `track_headers` is set — is at least as new as every header the compiler
+ * recorded via -MMD -MF; 0 when any of that fails. Toolchains with no
+ * dependency file (MSVC, assembly sources) compare sources only.
  */
 int forge_fingerprint_object_fresh(const char *object_path, const char *source_path,
-                                   int track_headers);
+                                   int track_headers, unsigned int command_hash);
+
+/* Stable FNV-1a hash of a text blob. Callers hash the finalized compile
+ * command line so a changed flag set — edited profile cflags, a bumped
+ * project version — recompiles exactly the objects that would differ. */
+unsigned int forge_fingerprint_hash_text(const char *text);
+
+/*
+ * Records `command_hash` in a "<object>.cmdhash" sidecar after a successful
+ * compile. Best effort: a failure simply makes the next run recompile once.
+ */
+void forge_fingerprint_record_command(const char *object_path,
+                                      unsigned int command_hash);
 
 /*
  * Picks a collision-free object path under `object_directory` for `source_path`.

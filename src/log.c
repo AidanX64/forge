@@ -5,10 +5,20 @@
 #include <errno.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
 #include "forge/platform.h"
+
+/*
+ * Nanosecond clocks and terminal detection need POSIX visibility; requesting
+ * it here (rather than relying on the build flags) keeps this file's console
+ * and timing helpers self-contained.
+ */
+#if !FORGE_PLATFORM_WINDOWS && !defined(__APPLE__)
+#define _POSIX_C_SOURCE 200809L
+#endif
 
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
@@ -16,14 +26,28 @@
 #define FORGE_LOG_USE_FSOPEN 1
 #include <share.h>
 #endif
+#include <io.h>
 #include <windows.h>
 #else
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #include "forge/log.h"
 #include "forge_util.h"
+
+#define FORGE_LOG_MESSAGE_MAX 2048U
+
+/* Console verbosity: written once by the CLI before any worker starts, so no
+ * lock is needed to read it from compile threads afterwards. */
+static ForgeVerbosity active_verbosity = FORGE_VERBOSITY_NORMAL;
+
+/* Attached by commands.c so milestone lines also land in target/logs. */
+static ForgeLogger *session_logger;
+
+/* Tri-state (-1 unset) so detection runs at most once, lazily. */
+static int colors_enabled = -1;
 
 static int create_directory(const char *path, char *error, size_t error_size)
 {
@@ -139,6 +163,126 @@ int forge_logger_init_in(ForgeLogger *logger, const char *project_root,
     return -1;
 }
 
+void forge_log_set_verbosity(ForgeVerbosity verbosity)
+{
+    if (verbosity >= FORGE_VERBOSITY_QUIET && verbosity <= FORGE_VERBOSITY_VERY_VERBOSE) {
+        active_verbosity = verbosity;
+    }
+}
+
+ForgeVerbosity forge_log_get_verbosity(void)
+{
+    return active_verbosity;
+}
+
+void forge_log_set_session_logger(ForgeLogger *logger)
+{
+    session_logger = logger;
+}
+
+double forge_log_monotonic_seconds(void)
+{
+#if FORGE_PLATFORM_WINDOWS
+    LARGE_INTEGER frequency;
+    LARGE_INTEGER counter;
+
+    if (QueryPerformanceFrequency(&frequency) == 0 || frequency.QuadPart == 0 ||
+        QueryPerformanceCounter(&counter) == 0) {
+        return 0.0;
+    }
+    return (double)counter.QuadPart / (double)frequency.QuadPart;
+#else
+    struct timespec now;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0.0;
+    }
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+#endif
+}
+
+/*
+ * Decides once whether status labels may be colored: NO_COLOR wins, a piped
+ * stdout stays plain, Windows consoles only get ANSI after enabling virtual
+ * terminal processing (Windows 10+), and every other tty is assumed to
+ * understand the escape codes.
+ */
+static int console_colors_enabled(void)
+{
+    if (colors_enabled >= 0) {
+        return colors_enabled;
+    }
+    colors_enabled = 0;
+    {
+        const char *no_color = getenv("NO_COLOR");
+
+        if (no_color == NULL || no_color[0] == '\0') {
+#if FORGE_PLATFORM_WINDOWS
+            HANDLE console = GetStdHandle(STD_OUTPUT_HANDLE);
+            DWORD mode = 0;
+
+            if (_isatty(_fileno(stdout)) && console != INVALID_HANDLE_VALUE &&
+                GetConsoleMode(console, &mode) != 0) {
+                if (SetConsoleMode(console,
+                                   mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0) {
+                    colors_enabled = 1;
+                }
+            }
+#else
+            colors_enabled = isatty(fileno(stdout));
+#endif
+        }
+    }
+    return colors_enabled;
+}
+
+#define FORGE_STATUS_LABEL_WIDTH 12U
+#define FORGE_COLOR_BOLD_GREEN "\x1b[1;32m"
+#define FORGE_COLOR_RESET "\x1b[0m"
+
+void forge_log_status(const char *label, const char *format, ...)
+{
+    va_list arguments;
+    char message[FORGE_LOG_MESSAGE_MAX];
+    char padded[FORGE_STATUS_LABEL_WIDTH + 1U];
+    size_t label_length;
+    int colored;
+
+    if (label == NULL || format == NULL) {
+        return;
+    }
+    va_start(arguments, format);
+    (void)vsnprintf(message, sizeof(message), format, arguments);
+    va_end(arguments);
+
+    /* QUIET shows errors and program output only; milestones disappear. */
+    if (active_verbosity != FORGE_VERBOSITY_QUIET) {
+        label_length = strlen(label);
+        if (label_length > FORGE_STATUS_LABEL_WIDTH) {
+            label_length = FORGE_STATUS_LABEL_WIDTH;
+        }
+        memset(padded, ' ', FORGE_STATUS_LABEL_WIDTH - label_length);
+        memcpy(padded + FORGE_STATUS_LABEL_WIDTH - label_length, label, label_length);
+        padded[FORGE_STATUS_LABEL_WIDTH] = '\0';
+        colored = console_colors_enabled();
+        if (colored) {
+            (void)fputs(FORGE_COLOR_BOLD_GREEN, stdout);
+        }
+        (void)fprintf(stdout, "%s ", padded);
+        if (colored) {
+            (void)fputs(FORGE_COLOR_RESET, stdout);
+        }
+        (void)fprintf(stdout, "%s\n", message);
+        (void)fflush(stdout);
+    }
+
+    /* Milestones join everything else in the invocation log. */
+    if (session_logger != NULL && session_logger->file != NULL) {
+        (void)fprintf(session_logger->file, "[INFO] [status] %s %s\n", label, message);
+        (void)fflush(session_logger->file);
+    }
+}
+
 static void write_log(ForgeLogger *logger, FILE *stream, const char *level,
                       const char *stage, const char *format, va_list arguments)
 {
@@ -165,6 +309,58 @@ void forge_logger_log(ForgeLogger *logger, const char *stage,
     va_list arguments;
     va_start(arguments, format);
     write_log(logger, stdout, "INFO", stage, format, arguments);
+    va_end(arguments);
+}
+
+/*
+ * Shared backend of the classified emitters: the log file always receives the
+ * line; the terminal only sees it when the chosen verbosity allows.
+ */
+static void write_classified(ForgeLogger *logger, const char *stage,
+                             ForgeConsoleLevel level, const char *format,
+                             va_list arguments)
+{
+    ForgeVerbosity required = level == FORGE_CONSOLE_COMMAND
+                                  ? FORGE_VERBOSITY_VERY_VERBOSE
+                                  : FORGE_VERBOSITY_VERBOSE;
+
+    if (logger != NULL && logger->file != NULL) {
+        (void)fprintf(logger->file, "[INFO] [%s] ", stage);
+        (void)vfprintf(logger->file, format, arguments);
+        fputc('\n', logger->file);
+        (void)fflush(logger->file);
+    }
+    if (active_verbosity >= required) {
+        /* The file branch above consumed the va_list, so the terminal echo
+         * needs its own copy before walking the arguments again. */
+        va_list copy;
+
+        va_copy(copy, arguments);
+        (void)fprintf(stdout, "[INFO] [%s] ", stage);
+        (void)vfprintf(stdout, format, copy);
+        fputc('\n', stdout);
+        (void)fflush(stdout);
+        va_end(copy);
+    }
+}
+
+void forge_logger_detail(ForgeLogger *logger, const char *stage,
+                         const char *format, ...)
+{
+    va_list arguments;
+
+    va_start(arguments, format);
+    write_classified(logger, stage, FORGE_CONSOLE_PROGRESS, format, arguments);
+    va_end(arguments);
+}
+
+void forge_logger_command(ForgeLogger *logger, const char *stage,
+                          const char *format, ...)
+{
+    va_list arguments;
+
+    va_start(arguments, format);
+    write_classified(logger, stage, FORGE_CONSOLE_COMMAND, format, arguments);
     va_end(arguments);
 }
 
