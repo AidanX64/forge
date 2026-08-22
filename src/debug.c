@@ -46,12 +46,50 @@ static int select_debugger(const ForgeHostInfo *host, char *program, size_t prog
     return -1;
 }
 
+/* Which command dialect the chosen debugger speaks. */
+typedef enum ForgeDebuggerFlavor {
+    FORGE_DEBUGGER_FLAVOR_GDB,
+    FORGE_DEBUGGER_FLAVOR_LLDB,
+    FORGE_DEBUGGER_FLAVOR_CDB
+} ForgeDebuggerFlavor;
+
+/*
+ * Classifies a debugger executable by its file name, not by exact string
+ * equality: FORGE_DEBUGGER=/usr/bin/lldb-18 or gdb-multiarch must pick the
+ * matching flag set. Versioned and prefixed names are common enough that
+ * prefix matching on the basename is the pragmatic rule.
+ */
+static ForgeDebuggerFlavor debugger_flavor(const char *program)
+{
+    const char *base = program;
+    const char *cursor;
+    size_t length;
+
+    for (cursor = program; *cursor != '\0'; ++cursor) {
+        if (*cursor == '/' || *cursor == '\\') {
+            base = cursor + 1;
+        }
+    }
+    length = strlen(base);
+    if (length > 4U && forge_util_has_suffix(base, ".exe")) {
+        length -= 4U;
+    }
+    if (length >= 3U && strncmp(base, "cdb", 3U) == 0) {
+        return FORGE_DEBUGGER_FLAVOR_CDB;
+    }
+    if (length >= 4U && strncmp(base, "lldb", 4U) == 0) {
+        return FORGE_DEBUGGER_FLAVOR_LLDB;
+    }
+    return FORGE_DEBUGGER_FLAVOR_GDB;
+}
+
 /* Builds the argv that runs the chosen debugger in batch mode. */
 static int make_debug_argv(const char *program, const char *executable_path,
                            ForgeArgv *argv, char *error, size_t error_size)
 {
-    if (strcmp(program, "cdb") == 0) {
-        if (forge_argv_append(argv, "cdb") != 0 ||
+    switch (debugger_flavor(program)) {
+    case FORGE_DEBUGGER_FLAVOR_CDB:
+        if (forge_argv_append(argv, program) != 0 ||
             forge_argv_append(argv, "-lines") != 0 ||
             forge_argv_append(argv, "-c") != 0 ||
             forge_argv_append(argv, "g; k; u @rip L20; q") != 0 ||
@@ -59,8 +97,9 @@ static int make_debug_argv(const char *program, const char *executable_path,
             forge_util_set_error(error, error_size, "out of memory while building debugger command");
             return -1;
         }
-    } else if (strcmp(program, "lldb") == 0) {
-        if (forge_argv_append(argv, "lldb") != 0 ||
+        break;
+    case FORGE_DEBUGGER_FLAVOR_LLDB:
+        if (forge_argv_append(argv, program) != 0 ||
             forge_argv_append(argv, "--batch") != 0 ||
             forge_argv_append(argv, "-o") != 0 ||
             forge_argv_append(argv, "run") != 0 ||
@@ -72,7 +111,9 @@ static int make_debug_argv(const char *program, const char *executable_path,
             forge_util_set_error(error, error_size, "out of memory while building debugger command");
             return -1;
         }
-    } else {
+        break;
+    default:
+        /* gdb: `disassemble /s` is the modern spelling; /m is deprecated. */
         if (forge_argv_append(argv, program) != 0 ||
             forge_argv_append(argv, "--batch") != 0 ||
             forge_argv_append(argv, "-q") != 0 ||
@@ -81,11 +122,12 @@ static int make_debug_argv(const char *program, const char *executable_path,
             forge_argv_append(argv, "-ex") != 0 ||
             forge_argv_append(argv, "bt") != 0 ||
             forge_argv_append(argv, "-ex") != 0 ||
-            forge_argv_append(argv, "disassemble /m main") != 0 ||
+            forge_argv_append(argv, "disassemble /s main") != 0 ||
             forge_argv_append(argv, executable_path) != 0) {
             forge_util_set_error(error, error_size, "out of memory while building debugger command");
             return -1;
         }
+        break;
     }
     return 0;
 }
