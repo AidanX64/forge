@@ -20,6 +20,14 @@
 typedef struct ForgeDepNode {
     char name[FORGE_MANIFEST_VALUE_MAX];
     char root[FORGE_PATH_MAX];
+    /* Source identity, kept so two declarations of the same dependency name
+     * with different sources fail loudly instead of first-one-wins. For git
+     * deps `source_url`/`source_ref` hold the manifest strings and
+     * `source_root` is empty; for path deps `source_root` holds the
+     * canonicalized directory and the other two are empty. */
+    char source_url[FORGE_MANIFEST_VALUE_MAX];
+    char source_ref[FORGE_MANIFEST_VALUE_MAX];
+    char source_path[FORGE_PATH_MAX];
     ForgeManifest *manifest;
     int is_native;
     /* Filled by the build stage: native deps point at their objects.txt
@@ -31,6 +39,17 @@ typedef struct ForgeDepGraph {
     ForgeDepNode nodes[FORGE_DEPS_MAX_NODES];
     size_t count;
 } ForgeDepGraph;
+
+/*
+ * Decides whether a manifest-supplied git URL is safe to hand to
+ * `git clone` verbatim: https://, ssh://, and scp-style git@host:path are
+ * allowed; everything else (ext::/fd:: transports that execute shell,
+ * file://, bare local paths, option-shaped "-..." strings) is rejected.
+ * FORGE_ALLOW_UNSAFE_GIT=1 in the environment lifts the restriction for
+ * local testing. Returns 0 when the URL is supported, -1 otherwise with a
+ * human-readable reason in `error`.
+ */
+int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_size);
 
 /*
  * Resolves the manifest's [dependencies] transitively: fetches git deps into

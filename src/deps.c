@@ -11,11 +11,15 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <io.h>
 #else
+#include <fcntl.h>
+#include <unistd.h>
 #include <dirent.h>
 #endif
 #include <sys/stat.h>
@@ -140,6 +144,31 @@ static int dir_has_file(const char *dir, const char *name)
            file_exists(path);
 }
 
+static void deps_sleep_ms(unsigned milliseconds)
+{
+#if FORGE_PLATFORM_WINDOWS
+    Sleep(milliseconds);
+#else
+    struct timespec pause;
+
+    pause.tv_sec = (time_t)(milliseconds / 1000U);
+    pause.tv_nsec = (long)(milliseconds % 1000U) * 1000000L;
+    nanosleep(&pause, NULL);
+#endif
+}
+
+/* Age of `path` in seconds, or -1 when it cannot be stat'ed. */
+static double path_age_seconds(const char *path)
+{
+    struct stat details;
+    time_t now = time(NULL);
+
+    if (stat(path, &details) != 0 || details.st_mtime > now) {
+        return -1.0;
+    }
+    return (double)(now - details.st_mtime);
+}
+
 /* Runs a program directly (no shell), echoing the command line through the
  * logger and capturing output into the invocation log like other stages. */
 static int run_tool(ForgeLogger *logger, const char *stage, ForgeArgv *argv,
@@ -154,6 +183,164 @@ static int run_tool(ForgeLogger *logger, const char *stage, ForgeArgv *argv,
     (void)forge_argv_finalize(argv);
     return forge_process_run(argv->items, capture_path, truncating_capture ? 0 : 1,
                              exit_code, error, error_size);
+}
+
+/* ------------------------------------------------------------------ */
+/* Git URL policy                                                      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * FORGE_ALLOW_UNSAFE_GIT lifts the URL restriction below for local and
+ * air-gapped testing (plain paths, file://, ...). Never enable it when
+ * resolving manifests you do not control.
+ */
+static int env_allows_unsafe_git(void)
+{
+    const char *override = getenv("FORGE_ALLOW_UNSAFE_GIT");
+
+    return override != NULL && override[0] != '\0' && strcmp(override, "0") != 0;
+}
+
+static int is_scheme_character(unsigned char character, int first)
+{
+    if ((character >= 'a' && character <= 'z') ||
+        (character >= 'A' && character <= 'Z')) {
+        return 1;
+    }
+    if (first) {
+        return 0;
+    }
+    return (character >= '0' && character <= '9') || character == '+' ||
+           character == '-' || character == '.';
+}
+
+static int scheme_matches(const char *url, size_t length, const char *name)
+{
+    size_t index;
+
+    for (index = 0U; index < length; ++index) {
+        if (tolower((unsigned char)url[index]) != name[index]) {
+            return 0;
+        }
+    }
+    return name[length] == '\0';
+}
+
+/*
+ * Manifest-supplied URLs go onto the `git clone` command line verbatim, so
+ * everything git accepts would implicitly be accepted here too — including
+ * ext::/fd:: pseudo-transports that execute arbitrary shell commands and
+ * option-shaped strings such as "--upload-pack=<program>". Forge therefore
+ * allowlists exactly the transports a source dependency plausibly uses:
+ *
+ *   https://host/path         ordinary public repositories
+ *   ssh://[user@]host/path    authenticated clones over SSH
+ *   [user@]host.tld:path      scp-style shorthand for ssh://
+ *
+ * Everything else is refused loudly rather than handed to git.
+ */
+int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_size)
+{
+    static const char *const rejection =
+        "use https://host/path, ssh://host/path, or git@host:path "
+        "(set FORGE_ALLOW_UNSAFE_GIT=1 to override)";
+    const char *cursor;
+    const char *colon;
+    size_t scheme_length;
+    int looks_like_scheme;
+
+    if (env_allows_unsafe_git()) {
+        return 0;
+    }
+    if (url == NULL || url[0] == '\0') {
+        forge_util_set_error(error, error_size, "git dependency has an empty URL");
+        return -1;
+    }
+    if (url[0] == '-') {
+        forge_util_set_error(error, error_size,
+                  "git URL '%s' starts with '-' and would be parsed by git as "
+                  "an option instead of a location", url);
+        return -1;
+    }
+    for (cursor = url; *cursor != '\0'; ++cursor) {
+        unsigned char character = (unsigned char)*cursor;
+
+        if (character < 0x20 || character == 0x7F) {
+            forge_util_set_error(error, error_size,
+                      "git URL '%s' contains control characters", url);
+            return -1;
+        }
+    }
+    colon = strchr(url, ':');
+    if (colon == NULL) {
+        forge_util_set_error(error, error_size,
+                  "git URL '%s' is not supported; %s", url, rejection);
+        return -1;
+    }
+    scheme_length = (size_t)(colon - url);
+    looks_like_scheme = is_scheme_character((unsigned char)url[0], 1);
+    for (cursor = url + 1; looks_like_scheme && cursor < colon; ++cursor) {
+        looks_like_scheme = is_scheme_character((unsigned char)*cursor, 0);
+    }
+    if (looks_like_scheme) {
+        /* Any well-formed transport prefix other than the two below is
+         * refused: ext:: and fd:: execute commands, file:// and plain
+         * schemes bypass the cache policy, http:// clones insecurely. */
+        if ((scheme_length == 5U && scheme_matches(url, scheme_length, "https")) ||
+            (scheme_length == 3U && scheme_matches(url, scheme_length, "ssh"))) {
+            return 0;
+        }
+        forge_util_set_error(error, error_size,
+                  "git URL '%s' uses the '%.*s:' transport, which forge does "
+                  "not allow; %s", url, (int)scheme_length, url, rejection);
+        return -1;
+    }
+    /* scp-style [user@]host:path: the piece before the ':' must actually
+     * look like a host (this also rejects Windows drive letters like C:).
+     * A host without any letter cannot be one. */
+    {
+        const char *host_start = url;
+
+        for (cursor = url; cursor < colon; ++cursor) {
+            if (*cursor == '@') {
+                host_start = cursor + 1;
+            }
+        }
+        if (host_start == colon || colon[1] == '\0' || colon[1] == ':') {
+            forge_util_set_error(error, error_size,
+                      "git URL '%s' is not a usable git@host:path reference; %s",
+                      url, rejection);
+            return -1;
+        }
+        for (cursor = host_start; cursor < colon; ++cursor) {
+            unsigned char character = (unsigned char)*cursor;
+
+            if (!(isalpha(character) || character == '.' || character == '-' ||
+                  character == '_' || character == '[' || character == ']')) {
+                forge_util_set_error(error, error_size,
+                          "git URL '%s' is not a usable git@host:path "
+                          "reference; %s", url, rejection);
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Ref names and locked SHAs also travel as lone argv elements; refuse
+ * option-shaped ones so neither a manifest nor a tampered lockfile can
+ * smuggle extra flags into `git checkout`. */
+static int checkout_target_is_safe(const char *target, const char *what,
+                                   const char *dependency_name,
+                                   char *error, size_t error_size)
+{
+    if (target[0] == '-') {
+        forge_util_set_error(error, error_size,
+                  "dependency '%s': %s '%s' is not a valid git reference",
+                  dependency_name, what, target);
+        return -1;
+    }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -246,22 +433,44 @@ static void discard_cache_dir(const char *cache_dir)
  * Makes sure `cache_dir` holds a clone of `url` with `target` (a ref, or a
  * locked commit SHA) checked out, and reports the resolved commit SHA.
  * When `locked_commit` is non-empty and no update was forced, the fetch is
- * skipped entirely so offline rebuilds stay quiet and fast.
+ * skipped entirely so offline rebuilds stay quiet and fast. With
+ * `submodules` set, submodules are cloned/updated alongside every checkout.
  */
 static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char *url,
                                const char *ref, const char *locked_commit,
-                               int force_update, const char *cache_dir,
+                               int force_update, int submodules,
+                               const char *cache_dir,
                                char *resolved_sha, size_t resolved_sha_size,
                                char *error, size_t error_size)
 {
     char capture[FORGE_PATH_MAX];
-    char *clone_arguments[] = { "clone", "--quiet", (char *)url, (char *)cache_dir, NULL };
+    char origin_target[FORGE_DEPS_VALUE_MAX + 8U];
+    /* Slots: clone --quiet <url> [--recurse-submodules] <dir> NULL. */
+    char *clone_arguments[6] = { "clone", "--quiet", (char *)url, (char *)cache_dir, NULL };
     char *fetch_arguments[] = { "fetch", "--quiet", "--tags", "origin", NULL };
     char *checkout_arguments[] = { "checkout", "--quiet", "--detach", NULL, NULL };
+    char *submodule_arguments[] = {
+        "submodule", "update", "--init", "--recursive", NULL
+    };
     char *revparse_arguments[] = { "rev-parse", "HEAD", NULL };
     char target[FORGE_DEPS_VALUE_MAX];
+    char *checkout_target = NULL;
     int use_locked = locked_commit[0] != '\0' && !force_update;
-    int needs_checkout = 1;
+    int just_cloned = 0;
+    int have_ref;
+
+    if (submodules) {
+        clone_arguments[3] = "--recurse-submodules";
+        clone_arguments[4] = (char *)cache_dir;
+        clone_arguments[5] = NULL;
+    }
+
+    if (checkout_target_is_safe(ref, "ref", name, error, error_size) != 0 ||
+        (use_locked && checkout_target_is_safe(locked_commit, "locked commit",
+                                               name, error, error_size) != 0)) {
+        return -1;
+    }
+    have_ref = ref[0] != '\0';
 
     /*
      * A directory without a .git entry is not a usable clone (an interrupted
@@ -282,43 +491,91 @@ static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char
             discard_cache_dir(cache_dir);
             return -1;
         }
-        /*
-         * The fresh clone already sits on the remote's default-branch tip,
-         * so there is nothing to check out — and no FETCH_HEAD either (that
-         * file only exists once a fetch ran), making any checkout here fail
-         * with "does not take a path argument".
-         */
-        needs_checkout = 0;
+        just_cloned = 1;
     } else if (!use_locked) {
         if (git_run(logger, cache_dir, fetch_arguments, NULL, 0, error, error_size) != 0) {
             return -1;
         }
     }
-    if (needs_checkout) {
-        if (use_locked) {
-            (void)snprintf(target, sizeof(target), "%s", locked_commit);
-        } else if (ref[0] != '\0') {
-            (void)snprintf(target, sizeof(target), "%s", ref);
-        } else {
-            /* No ref pinned: track the remote's default branch tip. */
-            (void)snprintf(target, sizeof(target), "FETCH_HEAD");
+
+    /*
+     * Reconcile HEAD with what the caller asked for — including right after
+     * a fresh clone. A cold clone lands on the remote's default-branch tip,
+     * but that is only correct when the manifest tracks that tip: honoring
+     * the lock pin and manifest ref here keeps a moved default branch from
+     * silently bypassing Forge.lock on fresh machines and CI runners.
+     */
+    if (use_locked) {
+        (void)snprintf(target, sizeof(target), "%s", locked_commit);
+        checkout_target = target;
+    } else if (have_ref) {
+        /*
+         * `fetch` only advances the remote-tracking refs; a local branch of
+         * the same name keeps its old commit, so checking out the bare name
+         * after a fetch would silently resolve a forced update right back
+         * onto the stale pin. Prefer the fresh remote-tracking ref once a
+         * fetch ran; on a cold clone nothing is stale, and the plain name
+         * (a branch may not exist locally yet) goes first. Whichever form
+         * fails, the other is retried below — tags and raw SHAs never exist
+         * under origin/, while brand-new branches never exist locally.
+         */
+        (void)snprintf(target, sizeof(target), "%s", ref);
+        (void)snprintf(origin_target, sizeof(origin_target), "origin/%s", ref);
+        checkout_target = just_cloned ? target : origin_target;
+    } else if (!just_cloned) {
+        /*
+         * No pin and no ref: track the remote's default branch tip.
+         * FETCH_HEAD only exists once a fetch ran, which is why a
+         * just-cloned repository skips this case entirely — it already
+         * sits exactly there.
+         */
+        (void)snprintf(target, sizeof(target), "FETCH_HEAD");
+        checkout_target = target;
+    }
+
+    if (checkout_target != NULL) {
+        const char *retry_target = NULL;
+
+        if (!use_locked && have_ref) {
+            retry_target = checkout_target == target ? origin_target : target;
         }
-        checkout_arguments[3] = target;
+        checkout_arguments[3] = checkout_target;
         if (git_run(logger, cache_dir, checkout_arguments, NULL, 0, error,
                     error_size) != 0) {
-            /*
-             * The locked commit may simply not exist in this local clone yet
-             * (the cache was cloned while a different ref was checked out).
-             * Fetch once and retry before giving up so offline-capable
-             * rebuilds still recover online.
-             */
-            if (!use_locked ||
-                git_run(logger, cache_dir, fetch_arguments, NULL, 0, error,
-                        error_size) != 0 ||
-                git_run(logger, cache_dir, checkout_arguments, NULL, 0, error,
-                        error_size) != 0) {
+            int recovered = 0;
+
+            if (use_locked) {
+                /*
+                 * The locked commit may simply not exist in this local clone yet
+                 * (the cache was cloned while a different ref was checked out).
+                 * Fetch once and retry before giving up so offline-capable
+                 * rebuilds still recover online.
+                 */
+                recovered = git_run(logger, cache_dir, fetch_arguments, NULL, 0,
+                                    error, error_size) == 0 &&
+                            git_run(logger, cache_dir, checkout_arguments, NULL, 0,
+                                    error, error_size) == 0;
+            } else if (retry_target != NULL) {
+                checkout_arguments[3] = (char *)retry_target;
+                recovered = git_run(logger, cache_dir, checkout_arguments, NULL, 0,
+                                    error, error_size) == 0;
+            }
+            if (!recovered) {
                 return -1;
             }
+        }
+    }
+    if (submodules) {
+        /*
+         * A detached checkout does not touch submodule working trees, and a
+         * moved pin can change which submodule commits are needed — sync
+         * them on every checkout, not only after a fresh clone.
+         */
+        if (git_run(logger, cache_dir, submodule_arguments, NULL, 0, error,
+                    error_size) != 0) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': updating git submodules failed", name);
+            return -1;
         }
     }
     if (snprintf(capture, sizeof(capture), "%s/revparse.tmp", cache_dir) < 0 ||
@@ -353,11 +610,48 @@ static ForgeLockEntry *lock_find(ForgeLockFile *lock, const char *name)
     return NULL;
 }
 
+static int write_lockfile_body(void *user_data, FILE *file)
+{
+    const ForgeLockFile *lock = user_data;
+    size_t index;
+
+    if (fputs("# Generated by forge. Do not edit.\n[dependencies]\n", file) < 0) {
+        return -1;
+    }
+    for (index = 0U; index < lock->count; ++index) {
+        const ForgeLockEntry *entry = &lock->items[index];
+
+        if (fprintf(file, "%s = { commit = \"%s\", url = \"%s\", ref = \"%s\" }\n",
+                    entry->name, entry->commit, entry->url, entry->ref) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 /*
  * Parses the generated Forge.lock subset:
  *   [dependencies]
  *   name = { commit = "...", url = "...", ref = "..." }
  */
+static int is_full_git_sha(const char *text)
+{
+    size_t index;
+
+    if (strlen(text) != 40U) {
+        return 0;
+    }
+    for (index = 0U; index < 40U; ++index) {
+        unsigned char character = (unsigned char)text[index];
+
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'f'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int load_lockfile(const char *path, ForgeLockFile *lock,
                          char *error, size_t error_size)
 {
@@ -459,6 +753,22 @@ static int load_lockfile(const char *path, ForgeLockFile *lock,
             }
             cursor = quote + 1;
         }
+        /*
+         * S2 gate: the pin is handed to `git checkout --detach` verbatim, and
+         * every value forge writes is a full lowercase SHA from rev-parse.
+         * Anything else here is a hand-edit or corruption; refuse it loudly
+         * instead of checking out whatever git resolves the string to.
+         */
+        if (!is_full_git_sha(entry->commit)) {
+            forge_util_set_error(error, error_size,
+                      "%s: dependency '%s' has a malformed commit pin '%s' "
+                      "(expected 40 hex digits); delete Forge.lock and run "
+                      "'forge update' to regenerate it",
+                      path, entry->name,
+                      entry->commit[0] != '\0' ? entry->commit : "<missing>");
+            (void)fclose(file);
+            return -1;
+        }
     }
     (void)fclose(file);
     return 0;
@@ -467,29 +777,8 @@ static int load_lockfile(const char *path, ForgeLockFile *lock,
 static int save_lockfile(const char *path, const ForgeLockFile *lock,
                          char *error, size_t error_size)
 {
-    FILE *file = fopen(path, "w");
-    size_t index;
-
-    if (file == NULL) {
-        forge_util_set_error(error, error_size, "could not write '%s'", path);
-        return -1;
-    }
-    (void)fputs("# Generated by forge. Do not edit.\n[dependencies]\n", file);
-    for (index = 0U; index < lock->count; ++index) {
-        const ForgeLockEntry *entry = &lock->items[index];
-
-        if (fprintf(file, "%s = { commit = \"%s\", url = \"%s\", ref = \"%s\" }\n",
-                    entry->name, entry->commit, entry->url, entry->ref) < 0) {
-            forge_util_set_error(error, error_size, "could not write '%s'", path);
-            (void)fclose(file);
-            return -1;
-        }
-    }
-    if (fclose(file) != 0) {
-        forge_util_set_error(error, error_size, "could not write '%s'", path);
-        return -1;
-    }
-    return 0;
+    return forge_util_replace_file(path, write_lockfile_body, (void *)lock,
+                                   error, error_size);
 }
 
 /* ------------------------------------------------------------------ */
@@ -525,6 +814,270 @@ static ForgeDepNode *graph_find_node(ForgeDepGraph *graph, const char *name)
     return NULL;
 }
 
+/* ------------------------------------------------------------------ */
+/* Path containment (S3)                                               */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Compares single path characters loosely: case-insensitively where the host
+ * filesystems usually are, and treating '/' and '\\' as interchangeable.
+ * Canonical forms produced by forge_paths_absolute use one separator style,
+ * but manifests may hand us either spelling, so the comparison stays
+ * forgiving rather than rejecting valid directories.
+ */
+static int loose_path_character_equal(char left, char right)
+{
+#if FORGE_PLATFORM_WINDOWS
+    if (tolower((unsigned char)left) != tolower((unsigned char)right)) {
+        int left_is_separator = left == '/' || left == '\\';
+        int right_is_separator = right == '/' || right == '\\';
+
+        return left_is_separator && right_is_separator;
+    }
+    return 1;
+#else
+    return left == right;
+#endif
+}
+
+/*
+ * True when `candidate` equals `root` or lives underneath it. Both paths must
+ * be canonical (no "." or ".." remaining); canonical forms never carry a
+ * trailing separator except at a filesystem root ("C:\", "/"), so an exact
+ * prefix plus a separator-or-end boundary check is sufficient. On POSIX the
+ * canonicalizer resolves symlinks (the directories exist by comparison time),
+ * so symlink escapes are caught too; on Windows canonicalization is lexical
+ * and a junction/symlink escape is still possible.
+ */
+static int canonical_path_is_within(const char *candidate, const char *root)
+{
+    size_t root_length = strlen(root);
+    size_t index;
+    char boundary;
+
+    for (index = 0U; index < root_length; ++index) {
+        if (candidate[index] == '\0' ||
+            !loose_path_character_equal(candidate[index], root[index])) {
+            return 0;
+        }
+    }
+    if (candidate[root_length] == '\0') {
+        return 1;
+    }
+    boundary = candidate[root_length];
+    return boundary == '/' || boundary == '\\';
+}
+
+/* Canonicalizes both sides first so callers can pass raw joined paths. */
+static int path_is_within(const char *candidate, const char *root)
+{
+    char canonical_candidate[FORGE_PATH_MAX];
+    char canonical_root[FORGE_PATH_MAX];
+
+    if (forge_paths_absolute(candidate, canonical_candidate,
+                             sizeof(canonical_candidate)) != 0 ||
+        forge_paths_absolute(root, canonical_root, sizeof(canonical_root)) != 0) {
+        /* Only buffer overflows fail here; such paths are unusable anyway. */
+        return 0;
+    }
+    return canonical_path_is_within(canonical_candidate, canonical_root);
+}
+
+/*
+ * S3 gate: true when `consumer_root` sits inside the shared dependency cache.
+ * A manifest from the cache is untrusted machine-local input, so its own path
+ * dependencies must stay inside its checkout instead of reaching arbitrary
+ * directories. The top-level project manifest is not confined — pointing your
+ * own project at ../libhello is documented, intended usage.
+ */
+static int consumer_root_is_cached(const char *consumer_root)
+{
+    char cache_home[FORGE_PATH_MAX];
+    char cache_canonical[FORGE_PATH_MAX];
+
+    if (forge_home_root(cache_home, sizeof(cache_home)) != 0 ||
+        forge_paths_absolute(cache_home, cache_canonical,
+                             sizeof(cache_canonical)) != 0) {
+        return 0;
+    }
+    return path_is_within(consumer_root, cache_canonical);
+}
+
+/* ------------------------------------------------------------------ */
+/* Dependency identity (M5)                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Two declarations of the same dependency name may only coexist when they
+ * name the same source: identical git URL and ref pair, or the same resolved
+ * directory for path deps. Anything else used to silently resolve to
+ * whichever declaration came first, hiding real conflicts behind build-order
+ * luck. Returns 0 when the sources agree, -1 with a short explanation of the
+ * difference in `reason`.
+ */
+static int dep_identity_conflicts(const ForgeDepNode *node,
+                                  const ForgeDependency *dependency,
+                                  const char *consumer_root,
+                                  char *reason, size_t reason_size)
+{
+    int node_is_git = node->source_url[0] != '\0';
+    int dependency_is_git = dependency->git_url[0] != '\0';
+
+    if (node_is_git != dependency_is_git) {
+        forge_util_set_error(reason, reason_size,
+                  "one declaration uses git '%s', the other path '%s'",
+                  node_is_git ? node->source_url : dependency->git_url,
+                  dependency_is_git ? dependency->path : node->source_path);
+        return -1;
+    }
+    if (node_is_git) {
+        if (strcmp(node->source_url, dependency->git_url) != 0) {
+            forge_util_set_error(reason, reason_size,
+                      "git URLs differ ('%s' vs '%s')",
+                      node->source_url, dependency->git_url);
+            return -1;
+        }
+        if (strcmp(node->source_ref, dependency->ref) != 0) {
+            forge_util_set_error(reason, reason_size,
+                      "refs differ ('%s' vs '%s')",
+                      node->source_ref[0] != '\0' ? node->source_ref : "<default>",
+                      dependency->ref[0] != '\0' ? dependency->ref : "<default>");
+            return -1;
+        }
+        return 0;
+    }
+    {
+        char declared[FORGE_PATH_MAX];
+        char declared_canonical[FORGE_PATH_MAX];
+
+        /*
+         * The same directory spelled relative to two different consumers is
+         * one source, not two, so both sides are compared where they land on
+         * disk rather than as text. The first occurrence was canonicalized
+         * when its node was created. Absolute manifest paths resolve as-is.
+         */
+        if (forge_paths_resolve(consumer_root, dependency->path, declared,
+                                sizeof(declared)) != 0 ||
+            forge_paths_absolute(declared, declared_canonical,
+                                 sizeof(declared_canonical)) != 0) {
+            if (strcmp(node->source_path, declared) != 0) {
+                forge_util_set_error(reason, reason_size,
+                          "paths differ ('%s' vs '%s')",
+                          node->source_path, declared);
+                return -1;
+            }
+            return 0;
+        }
+        if (!canonical_path_is_within(node->source_path, declared_canonical) &&
+            !canonical_path_is_within(declared_canonical, node->source_path)) {
+            forge_util_set_error(reason, reason_size,
+                      "paths differ ('%s' vs '%s')",
+                      node->source_path, declared_canonical);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Cache mutation gate (M6)                                            */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Two forge processes racing on the same cached repository interleave their
+ * clone/fetch/checkout steps and can leave behind half-written state that
+ * later runs keep discarding and re-cloning. A create-exclusive sentinel file
+ * next to the cache directory serializes them: contenders poll until the
+ * holder finishes, and a sentinel orphaned by a killed process is taken over
+ * once it is older than the staleness window.
+ */
+#define FORGE_CACHE_GATE_POLL_MS 100U
+#define FORGE_CACHE_GATE_TIMEOUT_SECONDS 30U
+#define FORGE_CACHE_GATE_STALE_SECONDS 120U
+
+typedef struct ForgeCacheGate {
+    char path[FORGE_PATH_MAX];
+    int held;
+} ForgeCacheGate;
+
+static void cache_gate_release(ForgeCacheGate *gate)
+{
+    if (gate->held) {
+        (void)remove(gate->path);
+        gate->held = 0;
+    }
+}
+
+/* One creation attempt: 1 when this process owns the sentinel, 0 otherwise. */
+static int cache_gate_try_create(const char *path)
+{
+#if FORGE_PLATFORM_WINDOWS
+    HANDLE handle = CreateFileA(path, GENERIC_WRITE, 0U, NULL, CREATE_NEW,
+                                FILE_ATTRIBUTE_NORMAL, NULL);
+
+    if (handle == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    (void)CloseHandle(handle);
+#else
+    int descriptor = open(path, O_CREAT | O_EXCL | O_WRONLY, 0644);
+
+    if (descriptor < 0) {
+        return 0;
+    }
+    (void)close(descriptor);
+#endif
+    return 1;
+}
+
+static int cache_gate_acquire(ForgeLogger *logger, const char *cache_dir,
+                              ForgeCacheGate *gate, char *error, size_t error_size)
+{
+    unsigned waited_ms = 0U;
+
+    (void)memset(gate, 0, sizeof(*gate));
+    if (snprintf(gate->path, sizeof(gate->path), "%s.lock", cache_dir) < 0 ||
+        strlen(cache_dir) + 6U >= sizeof(gate->path)) {
+        forge_util_set_error(error, error_size, "dependency cache path is too long");
+        return -1;
+    }
+    for (;;) {
+        double age;
+
+        if (cache_gate_try_create(gate->path)) {
+            gate->held = 1;
+            return 0;
+        }
+        age = path_age_seconds(gate->path);
+        if (age > (double)FORGE_CACHE_GATE_STALE_SECONDS) {
+            /*
+             * The holder died mid-operation. Stealing is safe because two
+             * live processes attempting it still serialize through the
+             * exclusive recreate: one wins, so the worst outcome is a
+             * redundant re-clone, never interleaved mutations.
+             */
+            deps_log(logger, "deps",
+                     "stale dependency lock '%s' (%.0fs old); taking over",
+                     gate->path, age);
+            if (remove(gate->path) != 0) {
+                deps_sleep_ms(FORGE_CACHE_GATE_POLL_MS);
+            }
+            continue;
+        }
+        if (waited_ms >= FORGE_CACHE_GATE_TIMEOUT_SECONDS * 1000U) {
+            forge_util_set_error(error, error_size,
+                      "another forge process appears to be working in '%s' "
+                      "(waited %us); delete '%s' if none is running",
+                      cache_dir, FORGE_CACHE_GATE_TIMEOUT_SECONDS, gate->path);
+            return -1;
+        }
+        deps_sleep_ms(FORGE_CACHE_GATE_POLL_MS);
+        waited_ms += FORGE_CACHE_GATE_POLL_MS;
+    }
+}
+
+
+
 static int resolve_recursive(ForgeResolveContext *context, const char *consumer_root,
                              const ForgeManifest *manifest, int depth,
                              char names[][FORGE_DEPS_VALUE_MAX])
@@ -556,7 +1109,22 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
 
         node = graph_find_node(context->graph, dependency->name);
         if (node != NULL) {
-            continue; /* already resolved (diamond); cycles caught above */
+            char reason[FORGE_COMMAND_MAX];
+
+            /*
+             * A diamond (same name, same source, reached twice) is fine and
+             * resolves once. The same name pointing at a different source is
+             * a manifest bug: refuse it instead of silently keeping whichever
+             * declaration happened to be resolved first.
+             */
+            if (dep_identity_conflicts(node, dependency, consumer_root, reason,
+                                       sizeof(reason)) != 0) {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "dependency '%s' is declared twice with conflicting "
+                          "sources (%s)", dependency->name, reason);
+                return -1;
+            }
+            continue;
         }
         if (context->graph->count == FORGE_DEPS_MAX_NODES) {
             forge_util_set_error(context->error, sizeof(context->error),
@@ -571,12 +1139,34 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                      strcmp(context->force_update_name, dependency->name) == 0);
 
         if (dependency->path[0] != '\0') {
-            if (forge_paths_join(root, sizeof(root), consumer_root,
-                                 dependency->path) != 0 ||
+            /*
+             * forge_paths_resolve, not a blind join: absolute paths in the
+             * manifest must land where they say ("C:/..." or "/..."), and a
+             * naive concat would bury them inside the consumer's directory.
+             */
+            if (forge_paths_resolve(consumer_root, dependency->path,
+                                    root, sizeof(root)) != 0 ||
                 !directory_exists(root)) {
                 forge_util_set_error(context->error, sizeof(context->error),
                           "path dependency '%s' does not exist at '%s'",
                           dependency->name, root);
+                return -1;
+            }
+            /*
+             * S3 gate: a manifest that lives inside the dependency cache is
+             * untrusted input, so its relative paths must stay inside the
+             * checkout that shipped them ("../../../elsewhere" stops here).
+             * Canonicalization resolves "." and ".." lexically on Windows
+             * and, because the directory had to exist to reach this point,
+             * symlinks too on POSIX (realpath).
+             */
+            if (consumer_root_is_cached(consumer_root) &&
+                !path_is_within(root, consumer_root)) {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "dependency '%s': path '%s' resolves outside its own "
+                          "checkout '%s'; cached dependencies may not use "
+                          "paths that escape them",
+                          dependency->name, dependency->path, consumer_root);
                 return -1;
             }
             is_native = dir_has_file(root, "Forge.toml");
@@ -586,7 +1176,16 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
             char cache_hash[32];
             char cache_dir[FORGE_PATH_MAX];
             char resolved_sha[FORGE_DEPS_VALUE_MAX];
+            char url_reason[FORGE_COMMAND_MAX];
 
+            /* K1 gate: the URL becomes a lone clone argument, so anything
+             * outside the allowlist must fail here, before git runs. */
+            if (forge_deps_git_url_is_supported(dependency->git_url, url_reason,
+                                                sizeof(url_reason)) != 0) {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "dependency '%s': %s", dependency->name, url_reason);
+                return -1;
+            }
             if (git_available(context->error, sizeof(context->error)) != 0 ||
                 forge_home_root(cache_home, sizeof(cache_home)) != 0) {
                 forge_util_set_error(context->error, sizeof(context->error),
@@ -602,16 +1201,51 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                           "dependency cache path is too long");
                 return -1;
             }
-            if (ensure_git_checkout(context->logger, dependency->name,
-                                    dependency->git_url, dependency->ref,
-                                    locked != NULL &&
-                                    strcmp(locked->url, dependency->git_url) == 0 &&
-                                    strcmp(locked->ref, dependency->ref) == 0 ?
-                                        locked->commit : "",
-                                    dep_force, cache_dir,
-                                    resolved_sha, sizeof(resolved_sha),
-                                    context->error, sizeof(context->error)) != 0) {
-                return -1;
+            /*
+             * The mutation gate below drops its sentinel next to the cache
+             * directory, so the shared cache root must exist even before the
+             * very first clone.
+             */
+            {
+                char cache_git_root[FORGE_PATH_MAX];
+
+                if (forge_paths_join(cache_git_root, sizeof(cache_git_root),
+                                     cache_home, "git") != 0 ||
+                    forge_paths_ensure_directory(cache_git_root, context->error,
+                                                 sizeof(context->error)) != 0) {
+                    forge_util_set_error(context->error, sizeof(context->error),
+                              "cannot resolve '%s': %s", dependency->name,
+                              context->error);
+                    return -1;
+                }
+            }
+            /*
+             * M6 gate: serialize clone/fetch/checkout against other forge
+             * processes targeting the same cached repository.
+             */
+            {
+                ForgeCacheGate gate;
+                int checkout_status;
+
+                if (cache_gate_acquire(context->logger, cache_dir, &gate,
+                                       context->error,
+                                       sizeof(context->error)) != 0) {
+                    return -1;
+                }
+                checkout_status = ensure_git_checkout(
+                    context->logger, dependency->name,
+                    dependency->git_url, dependency->ref,
+                    locked != NULL &&
+                    strcmp(locked->url, dependency->git_url) == 0 &&
+                    strcmp(locked->ref, dependency->ref) == 0 ?
+                        locked->commit : "",
+                    dep_force, dependency->submodules, cache_dir,
+                    resolved_sha, sizeof(resolved_sha),
+                    context->error, sizeof(context->error));
+                cache_gate_release(&gate);
+                if (checkout_status != 0) {
+                    return -1;
+                }
             }
             deps_log(context->logger, "deps", "resolved %s @ %s",
                      dependency->name, resolved_sha);
@@ -666,9 +1300,39 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
             }
         }
 
+        /*
+         * The recursion above can fill any remaining slots, so capacity must
+         * be re-checked at the point of insertion — checking only before the
+         * recursive descent let a deep subtree write past nodes[].
+         */
+        if (context->graph->count >= FORGE_DEPS_MAX_NODES) {
+            free(parsed);
+            forge_util_set_error(context->error, sizeof(context->error),
+                      "more than %u dependencies", FORGE_DEPS_MAX_NODES);
+            return -1;
+        }
         node = &context->graph->nodes[context->graph->count++];
         (void)snprintf(node->name, sizeof(node->name), "%s", dependency->name);
         (void)snprintf(node->root, sizeof(node->root), "%s", root);
+        node->source_url[0] = '\0';
+        node->source_ref[0] = '\0';
+        node->source_path[0] = '\0';
+        if (dependency->git_url[0] != '\0') {
+            (void)snprintf(node->source_url, sizeof(node->source_url), "%s",
+                           dependency->git_url);
+            (void)snprintf(node->source_ref, sizeof(node->source_ref), "%s",
+                           dependency->ref);
+        } else {
+            /*
+             * Canonical spelling so the same directory reached through two
+             * different consumers compares equal (M5).
+             */
+            if (forge_paths_absolute(root, node->source_path,
+                                     sizeof(node->source_path)) != 0) {
+                (void)snprintf(node->source_path, sizeof(node->source_path),
+                               "%s", root);
+            }
+        }
         node->manifest = parsed;
         node->is_native = is_native;
         node->link_artifact[0] = '\0';
@@ -959,6 +1623,92 @@ static int find_static_artifact(const char *root, char *artifact, size_t artifac
     return 1; /* nothing found */
 }
 
+/* ------------------------------------------------------------------ */
+/* Build-script trust (S1)                                             */
+/* ------------------------------------------------------------------ */
+
+#define FORGE_SCRIPTS_MARKER ".forge-scripts-approved"
+
+/*
+ * Building a foreign dependency runs its cmake/make scripts — third-party
+ * code execution on every build. Gate the first run behind an explicit
+ * decision:
+ *
+ *   FORGE_ALLOW_DEP_BUILD_SCRIPTS=0   refuse outright (CI hardening)
+ *   FORGE_ALLOW_DEP_BUILD_SCRIPTS=1   pre-approve everything
+ *   otherwise                          ask once per dependency checkout;
+ *                                      approval is recorded next to the
+ *                                      clone so a fresh clone re-asks.
+ */
+static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_name,
+                                 const char *dependency_root, const char *kind,
+                                 char *error, size_t error_size)
+{
+    const char *override = getenv("FORGE_ALLOW_DEP_BUILD_SCRIPTS");
+    char marker_path[FORGE_PATH_MAX];
+    FILE *answer_file;
+
+    if (override != NULL && override[0] != '\0') {
+        if (strcmp(override, "0") == 0) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s' needs to run %s build scripts, but "
+                      "FORGE_ALLOW_DEP_BUILD_SCRIPTS=0 forbids them",
+                      dependency_name, kind);
+            return -1;
+        }
+        return 0;
+    }
+    if (forge_paths_join(marker_path, sizeof(marker_path), dependency_root,
+                         FORGE_SCRIPTS_MARKER) != 0) {
+        forge_util_set_error(error, error_size, "dependency path is too long");
+        return -1;
+    }
+    if (file_exists(marker_path)) {
+        return 0;
+    }
+#if FORGE_PLATFORM_WINDOWS
+    if (_isatty(_fileno(stdin)) == 0) {
+#else
+    if (isatty(fileno(stdin)) == 0) {
+#endif
+        forge_util_set_error(error, error_size,
+                  "dependency '%s' wants to run %s build scripts, but no "
+                  "terminal is attached to approve them; set "
+                  "FORGE_ALLOW_DEP_BUILD_SCRIPTS=1 to allow (or =0 to deny)",
+                  dependency_name, kind);
+        return -1;
+    }
+    fprintf(stderr,
+            "forge: dependency '%s' (%s)\n"
+            "forge: will now execute third-party %s build scripts.\n"
+            "forge: Allow? [y/N] ",
+            dependency_name, dependency_root, kind);
+    (void)fflush(stderr);
+    {
+        int answer = fgetc(stdin);
+
+        if (answer != 'y' && answer != 'Y') {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s' was not approved to run %s build "
+                      "scripts; set FORGE_ALLOW_DEP_BUILD_SCRIPTS=0 to make "
+                      "this refusal permanent",
+                      dependency_name, kind);
+            return -1;
+        }
+    }
+    /* Record the decision so later builds of this checkout stay quiet. */
+    answer_file = fopen(marker_path, "w");
+    if (answer_file != NULL) {
+        (void)fputs("approved\n", answer_file);
+        (void)fclose(answer_file);
+    } else {
+        deps_log(logger, "deps",
+                 "could not record script approval for '%s'; it will be "
+                 "requested again", dependency_name);
+    }
+    return 0;
+}
+
 int forge_deps_build_foreign(const ForgeDepNode *node, const ForgeCompiler *compiler,
                              int release, int max_jobs, ForgeLogger *logger,
                              char *artifact, size_t artifact_size,
@@ -967,9 +1717,22 @@ int forge_deps_build_foreign(const ForgeDepNode *node, const ForgeCompiler *comp
     const char *build_type = release ? "Release" : "Debug";
     const char *capture_path = logger != NULL ? logger->path : NULL;
     char jobs[16];
+    const char *kind = NULL;
     int exit_code = 0;
     int status;
 
+    if (dir_has_file(node->root, "CMakeLists.txt")) {
+        kind = "CMake";
+    } else if (dir_has_file(node->root, "Makefile") ||
+               dir_has_file(node->root, "makefile") ||
+               dir_has_file(node->root, "GNUmakefile")) {
+        kind = "Make";
+    }
+    if (kind != NULL &&
+        build_scripts_allowed(logger, node->name, node->root, kind, error,
+                              error_size) != 0) {
+        return -1;
+    }
     (void)snprintf(jobs, sizeof(jobs), "%d",
                    max_jobs > 0 ? max_jobs : forge_thread_processor_count());
     deps_log(logger, "deps", "building foreign dependency '%s' in %s",

@@ -450,6 +450,140 @@ static int select_host_target(const ForgeManifest *manifest, const ForgeHostInfo
     return 0;
 }
 
+/* Body writer for the atomic objects.txt replacement below. */
+typedef struct ForgeObjectListBody {
+    const char **references;
+    size_t count;
+} ForgeObjectListBody;
+
+static int write_object_list_body(void *user_data, FILE *file)
+{
+    const ForgeObjectListBody *body = user_data;
+    size_t index;
+
+    for (index = 0U; index < body->count; ++index) {
+        if (fprintf(file, "%s\n", body->references[index]) < 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * True when `child` belongs to the current build's live object set: either a
+ * listed object itself or its depfile twin (`<hash>.o` <-> `<hash>.d`) —
+ * depfiles are never in the object list, and deleting them would force a
+ * full recompile on every build.
+ */
+static int object_artifact_is_used(const char *child,
+                                   char (*used_paths)[FORGE_PATH_MAX],
+                                   size_t used_count)
+{
+    size_t index;
+    size_t length = strlen(child);
+    const char *twin = NULL;
+    char object_spelling[FORGE_PATH_MAX];
+
+    for (index = 0U; index < used_count; ++index) {
+        if (strcmp(used_paths[index], child) == 0) {
+            return 1;
+        }
+    }
+    if (!forge_util_has_suffix(child, ".d")) {
+        return 0;
+    }
+    if (length + 1U >= sizeof(object_spelling)) {
+        return 0;
+    }
+    (void)snprintf(object_spelling, sizeof(object_spelling), "%s", child);
+    object_spelling[length - 1U] = 'o'; /* ".d" -> ".o" */
+    twin = object_spelling;
+    for (index = 0U; index < used_count; ++index) {
+        if (strcmp(used_paths[index], twin) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Deletes .o/.d files in `directory` that no current source produced, so a
+ * renamed or deleted translation unit cannot keep feeding stale objects into
+ * incremental link decisions. Best effort: failures (locked files, exotic
+ * permissions) are counted and reported but never fail the build.
+ */
+static void remove_orphan_objects(const char *directory,
+                                  char (*used_paths)[FORGE_PATH_MAX],
+                                  size_t used_count)
+{
+#if FORGE_PLATFORM_WINDOWS
+    WIN32_FIND_DATAA entry;
+    HANDLE handle;
+    char pattern[FORGE_PATH_MAX];
+#else
+    DIR *stream;
+    struct dirent *entry;
+#endif
+    size_t removed = 0U;
+
+    if (directory == NULL || used_paths == NULL) {
+        return;
+    }
+#if FORGE_PLATFORM_WINDOWS
+    if (forge_paths_join(pattern, sizeof(pattern), directory, "*") != 0) {
+        return;
+    }
+    handle = FindFirstFileA(pattern, &entry);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    do {
+        char child[FORGE_PATH_MAX];
+        int is_artifact =
+            forge_util_has_suffix(entry.cFileName, ".o") ||
+            forge_util_has_suffix(entry.cFileName, ".d") ||
+            forge_util_has_suffix(entry.cFileName, ".obj");
+
+        if (!is_artifact ||
+            forge_paths_join(child, sizeof(child), directory,
+                             entry.cFileName) != 0) {
+            continue;
+        }
+        if (!object_artifact_is_used(child, used_paths, used_count) &&
+            DeleteFileA(child) != 0) {
+            ++removed;
+        }
+    } while (FindNextFileA(handle, &entry) != 0);
+    (void)FindClose(handle);
+#else
+    stream = opendir(directory);
+    if (stream == NULL) {
+        return;
+    }
+    while ((entry = readdir(stream)) != NULL) {
+        char child[FORGE_PATH_MAX];
+        int is_artifact =
+            forge_util_has_suffix(entry->d_name, ".o") ||
+            forge_util_has_suffix(entry->d_name, ".d");
+
+        if (!is_artifact ||
+            forge_paths_join(child, sizeof(child), directory,
+                             entry->d_name) != 0) {
+            continue;
+        }
+        if (!object_artifact_is_used(child, used_paths, used_count) &&
+            unlink(child) == 0) {
+            ++removed;
+        }
+    }
+    (void)closedir(stream);
+#endif
+    if (removed != 0U) {
+        forge_logger_log(active_logger, "compile",
+                         "removed %zu orphaned object file(s)", removed);
+    }
+}
+
 typedef struct ForgeCompileContext {
     const ForgeCompiler *compiler;
     const ForgeBuildProfile *profile;
@@ -737,6 +871,9 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                                                     sizeof(node->link_artifact),
                                                     error, sizeof(error)) != 0) {
                     print_error("%s", error);
+                    /* The cmake/make output landed in the invocation log;
+                     * surface its tail like every other failed stage. */
+                    print_log_tail(24U);
                     goto cleanup;
                 }
             }
@@ -821,8 +958,14 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     context.target_arch = target_arch;
     context.count = sources.count;
     context.next = 0U;
-    forge_mutex_init(&context.job_mutex);
-    forge_mutex_init(&context.log_mutex);
+    if (forge_mutex_init(&context.job_mutex) != 0 ||
+        forge_mutex_init(&context.log_mutex) != 0) {
+        forge_mutex_destroy(&context.job_mutex);
+        forge_mutex_destroy(&context.log_mutex);
+        print_error("out of memory while initializing build locks");
+        print_log_tail(24U);
+        goto cleanup;
+    }
     if (run_compile_pool(&context, max_jobs) != 0) {
         forge_mutex_destroy(&context.job_mutex);
         forge_mutex_destroy(&context.log_mutex);
@@ -844,6 +987,13 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     forge_logger_log(active_logger, "compile",
                      "compiled %zu, up-to-date %zu", context.compiled, context.skipped);
 
+    /*
+     * Sources that were renamed or deleted leave their .o/.d behind forever
+     * otherwise; sweep them now that the live object set is known. Best
+     * effort — a file held open by an editor or AV scanner is skipped.
+     */
+    remove_orphan_objects(object_directory, object_paths, sources.count);
+
     if (mode == FORGE_BUILD_MODE_COMPILE_ONLY) {
         forge_logger_log(active_logger, "check",
                          "check: all %zu translation unit(s) compiled", sources.count);
@@ -855,29 +1005,24 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
      * them directly without an intermediate archive. */
     if (mode == FORGE_BUILD_MODE_DEP_OBJECTS) {
         char list_path[FORGE_PATH_MAX];
-        FILE *list_file;
-        size_t list_index;
 
         if (forge_paths_join(list_path, sizeof(list_path), profile_directory,
                              "objects.txt") != 0) {
             print_error("object list path is too long");
             goto cleanup;
         }
-        list_file = fopen(list_path, "w");
-        if (list_file == NULL) {
-            print_error("could not write '%s'", list_path);
-            goto cleanup;
-        }
-        for (list_index = 0U; list_index < sources.count; ++list_index) {
-            if (fprintf(list_file, "%s\n", object_references[list_index]) < 0) {
-                print_error("could not write '%s'", list_path);
-                (void)fclose(list_file);
+        {
+            ForgeObjectListBody body;
+            char list_error[256];
+
+            body.references = object_references;
+            body.count = sources.count;
+            if (forge_util_replace_file(list_path, write_object_list_body,
+                                        &body, list_error,
+                                        sizeof(list_error)) != 0) {
+                print_error("could not write '%s': %s", list_path, list_error);
                 goto cleanup;
             }
-        }
-        if (fclose(list_file) != 0) {
-            print_error("could not write '%s'", list_path);
-            goto cleanup;
         }
         if (built_executable != NULL && built_executable_size != 0U) {
             (void)snprintf(built_executable, built_executable_size, "%s", list_path);

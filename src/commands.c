@@ -176,7 +176,12 @@ int forge_orchestrate_update(const char *manifest_path, const char *only_name)
                              "'%s' is a path dependency; nothing to update", only_name);
         }
     }
-    result = forge_deps_resolve(root, &manifest, resolve_name == NULL ? 0 : 1,
+    /*
+     * Bare `update` forces every dependency past its pin (the documented
+     * "re-resolve all" behavior); naming one restricts the force to that
+     * dependency alone via force_update_name.
+     */
+    result = forge_deps_resolve(root, &manifest, resolve_name == NULL ? 1 : 0,
                                 resolve_name != NULL ? resolve_name : "", &graph,
                                 &logger, error, sizeof(error)) == 0 ? 0 : 1;
     if (result != 0 && error[0] != '\0') {

@@ -159,28 +159,27 @@ static int read_lines(const char *path, ForgeLineList *lines,
     return 0;
 }
 
-static int write_lines(const char *path, const ForgeLineList *lines,
-                       char *error, size_t error_size)
+static int write_manifest_body(void *user_data, FILE *file)
 {
-    FILE *file = fopen(path, "wb");
+    const ForgeLineList *lines = user_data;
     size_t index;
 
-    if (file == NULL) {
-        forge_util_set_error(error, error_size, "could not write manifest '%s'", path);
-        return -1;
-    }
     for (index = 0U; index < lines->count; ++index) {
         if (fputs(lines->items[index], file) < 0) {
-            forge_util_set_error(error, error_size, "could not write manifest '%s'", path);
-            (void)fclose(file);
             return -1;
         }
     }
-    if (fclose(file) != 0) {
-        forge_util_set_error(error, error_size, "could not write manifest '%s'", path);
-        return -1;
-    }
     return 0;
+}
+
+/* Atomic via tmp+rename: a crash mid-add/remove must not truncate the
+ * manifest, and concurrent forge invocations must never observe half a
+ * rewrite. */
+static int write_lines(const char *path, const ForgeLineList *lines,
+                       char *error, size_t error_size)
+{
+    return forge_util_replace_file(path, write_manifest_body, (void *)lines,
+                                   error, error_size);
 }
 
 /* Copies `text` with '"' and '\' escaped the way the manifest parser reads
@@ -474,6 +473,17 @@ int forge_pkg_add(const char *manifest_path, const char *name,
                   "'%s' is not a valid dependency name; use letters, digits, '-', '_', '.'",
                   name);
         return -1;
+    }
+    if (has_git) {
+        char url_reason[FORGE_COMMAND_MAX];
+
+        /* Same transport allowlist the resolver enforces, checked here so a
+         * bad URL never reaches the manifest in the first place. */
+        if (forge_deps_git_url_is_supported(git_url, url_reason,
+                                            sizeof(url_reason)) != 0) {
+            forge_util_set_error(error, error_size, "'%s': %s", name, url_reason);
+            return -1;
+        }
     }
     if (has_ref && !has_git) {
         forge_util_set_error(error, error_size,
