@@ -273,8 +273,8 @@ sha010="$(make_registry_pkg hello_c 0.1.0 42)"
 make_consumer "$work/c1" '#include <stdio.h>
 #include "hello_c.h"
 int main(void) { printf("%d\n", hello_c_value()); return hello_c_value(); }'
-(cd "$work/c1" && "$FORGE" add greeting --registry hello_c --version 0.1.0 >/dev/null 2>&1) \
-    || fail "R1: add --registry failed"
+(cd "$work/c1" && "$FORGE" add greeting --registry hello_c --version 0.1.0 >"$work/r1.log" 2>&1) \
+    || { cat "$work/r1.log"; fail "R1: add --registry failed"; }
 grep -q 'greeting = { registry = "hello_c", version = "0.1.0" }' "$work/c1/Forge.toml" \
     || fail "R1: manifest entry not pinned"
 grep -q "greeting = .*kind = \"url\".*version = \"0.1.0\".*sha256 = \"$sha010\"" "$work/c1/Forge.lock" \
