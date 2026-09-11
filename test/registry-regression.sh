@@ -110,6 +110,11 @@ pass() {
 }
 
 # --- stub registry ----------------------------------------------------
+# Default features blob when FEATURES_JSON is unset. Kept in a variable so
+# the inner quotes are data: quotes written literally in a :- default are
+# syntactic and get quote-removed on some shells (macOS bash 3.2), which
+# used to emit bare keys and invalid JSON.
+FEATURES_JSON_DEFAULT='"features": [], "default-features": []'
 # make_registry_pkg <name> <version> <retval> [revision]: (re)builds one
 # stub package (lib sources + tarball + JSON), then refreshes the index.
 make_registry_pkg() {
@@ -160,9 +165,6 @@ EOF
     tar -czf "$out/$name-$version.tar.gz" -C "$src" Forge.toml include src
     local sha
     sha="$(sha256_of "$out/$name-$version.tar.gz")"
-    # NB: the inner quotes below are backslash-escaped so they survive the
-    # expansion (unescaped quotes in a :- default are syntactic and get
-    # quote-removed, which used to emit bare keys and invalid JSON).
     cat >"$out/$version.json" <<EOF
 {
   "name": "$name",
@@ -176,7 +178,7 @@ EOF
   "dependencies": [],
   "source": {"kind": "url", "location": "/packages/$name/$name-$version.tar.gz", "sha256": "$sha"},
   "patches": [],
-  ${FEATURES_JSON:-\"features\": [], \"default-features\": []},
+  ${FEATURES_JSON:-$FEATURES_JSON_DEFAULT},
   "forge": {"manifest": "/packages/$name/Forge.toml"}
 }
 EOF
