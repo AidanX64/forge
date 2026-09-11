@@ -40,7 +40,9 @@
 #define FORGE_LOCK_LINE_MAX 4096U
 
 /* One pinned dependency as recorded in Forge.lock. Plain git entries retain
- * their historical shape; registry entries carry an explicit source kind. */
+ * their historical shape; registry entries carry an explicit source kind.
+ * Registry revision 0 doubles as "predates revisions" for old lockfiles;
+ * features default to "" likewise. */
 typedef struct ForgeLockEntry {
     char name[FORGE_DEPS_VALUE_MAX];
     char commit[FORGE_DEPS_VALUE_MAX];
@@ -50,6 +52,8 @@ typedef struct ForgeLockEntry {
     char sha256[FORGE_DEPS_VALUE_MAX];
     char kind[8];
     char location[FORGE_PATH_MAX];
+    unsigned revision;
+    char features[FORGE_FEATURES_JOINED_MAX];
 } ForgeLockEntry;
 
 typedef struct ForgeLockFile {
@@ -778,9 +782,10 @@ static int write_lockfile_body(void *user_data, FILE *file)
                 return -1;
             }
         } else {
-            if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", sha256 = \"%s\" }\n",
+            if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", sha256 = \"%s\", revision = \"%u\", features = \"%s\" }\n",
                         entry->name, entry->kind, entry->version,
-                        entry->location, entry->sha256) < 0) {
+                        entry->location, entry->sha256, entry->revision,
+                        entry->features) < 0) {
                 return -1;
             }
         }
@@ -827,6 +832,31 @@ static int is_full_sha256(const char *text)
             return 0;
         }
     }
+    return 1;
+}
+
+/*
+ * Registry recipe revisions are small decimal integers (shared bound with
+ * the registry schema). Absent in old lockfiles, where revision 0 applies.
+ */
+static int lock_revision_is_valid(const char *text, unsigned *out)
+{
+    unsigned long value = 0UL;
+    size_t index;
+
+    if (text == NULL || text[0] == '\0') {
+        return 0;
+    }
+    for (index = 0U; text[index] != '\0'; ++index) {
+        if (!isdigit((unsigned char)text[index])) {
+            return 0;
+        }
+        value = value * 10UL + (unsigned long)(text[index] - '0');
+        if (value > FORGE_REGISTRY_MAX_REVISION) {
+            return 0;
+        }
+    }
+    *out = (unsigned)value;
     return 1;
 }
 
@@ -936,6 +966,36 @@ static int load_lockfile(const char *path, ForgeLockFile *lock,
                 (void)snprintf(entry->kind, sizeof(entry->kind), "%s", value);
             } else if (strcmp(key_start, "location") == 0) {
                 (void)snprintf(entry->location, sizeof(entry->location), "%s", value);
+            } else if (strcmp(key_start, "revision") == 0) {
+                if (!lock_revision_is_valid(value, &entry->revision)) {
+                    forge_util_set_error(error, error_size,
+                              "%s: dependency '%s' has a malformed registry pin; "
+                              "delete Forge.lock and run 'forge update' to regenerate it",
+                              path, entry->name);
+                    (void)fclose(file);
+                    return -1;
+                }
+            } else if (strcmp(key_start, "features") == 0) {
+                ForgeDependency scratch;
+
+                /*
+                 * Reuse the manifest feature parser so lock spellings
+                 * normalize (sorted, deduplicated) exactly like manifest
+                 * ones; old lockfiles without the key keep "".
+                 */
+                memset(&scratch, 0, sizeof(scratch));
+                if (forge_parse_feature_list(entry->name[0] != '\0' ?
+                                             entry->name : "?",
+                                             value, &scratch,
+                                             error, error_size) != 0 ||
+                    forge_features_join(scratch.feature_count,
+                                        scratch.features,
+                                        entry->features,
+                                        sizeof(entry->features)) != 0) {
+                    forge_util_prepend_error(error, error_size, "%s: ", path);
+                    (void)fclose(file);
+                    return -1;
+                }
             }
             cursor = quote + 1;
         }
@@ -1145,12 +1205,20 @@ static int consumer_root_is_cached(const char *consumer_root)
 /* Dependency identity (M5)                                            */
 /* ------------------------------------------------------------------ */
 
+static int expand_with_stored_defaults(const char *stored,
+                                       const ForgeDependency *dependency,
+                                       char *out, size_t out_size,
+                                       char *error, size_t error_size);
+
 /*
  * Two declarations of the same dependency name may only coexist when they
- * name the same source: identical git URL and ref pair, identical registry
- * package and version, or the same resolved directory for path deps.
- * Anything else used to silently resolve to whichever declaration happened
- * to resolve first. Returns 0 when the sources agree, -1 with a short
+ * name the same source: identical git URL and ref pair, the same registry
+ * package with compatible versions, or the same resolved directory for
+ * path deps. Registry compatibility is checked against what actually
+ * resolved: exact pins must equal the resolved version, minimums must be
+ * satisfied by it, and bare declarations float onto anything. Anything
+ * else used to silently resolve to whichever declaration happened to be
+ * resolved first. Returns 0 when the sources agree, -1 with a short
  * explanation of the difference in `reason`.
  */
 static int dep_identity_conflicts(const ForgeDepNode *node,
@@ -1182,13 +1250,53 @@ static int dep_identity_conflicts(const ForgeDepNode *node,
                       node->source_url, dependency->registry);
             return -1;
         }
-        if (strcmp(node->source_ref, dependency->registry_version) != 0) {
+        if (dependency->registry_version[0] != '\0') {
+            if (strcmp(node->resolved_version,
+                       dependency->registry_version) != 0) {
+                forge_util_set_error(reason, reason_size,
+                          "registry versions differ (resolved '%s' vs "
+                          "required '%s')",
+                          node->resolved_version[0] != '\0' ?
+                              node->resolved_version : "<latest>",
+                          dependency->registry_version);
+                return -1;
+            }
+        } else if (dependency->registry_min_version[0] != '\0' &&
+            (node->resolved_version[0] == '\0' ||
+             forge_version_compare(node->resolved_version,
+                                   dependency->registry_min_version) < 0)) {
             forge_util_set_error(reason, reason_size,
-                      "registry versions differ ('%s' vs '%s')",
-                      node->source_ref[0] != '\0' ? node->source_ref : "<latest>",
-                      dependency->registry_version[0] != '\0' ?
-                          dependency->registry_version : "<latest>");
+                      "registry version '%s' is below the required minimum "
+                      "'%s'",
+                      node->resolved_version[0] != '\0' ?
+                          node->resolved_version : "<latest>",
+                      dependency->registry_min_version);
             return -1;
+        }
+        /*
+         * Feature sets compare on effective spelling: the later
+         * declaration expands against the recorded defaults. First
+         * declaration wins; anything else conflicts loudly rather than
+         * rebuilding shared state mid-resolution. This runs for exact
+         * pins too: same version with different features is still a
+         * divergent diamond.
+         */
+        {
+            char wanted[FORGE_FEATURES_JOINED_MAX];
+
+            if (expand_with_stored_defaults(node->defaults, dependency,
+                                            wanted, sizeof(wanted),
+                                            reason, reason_size) != 0) {
+                return -1;
+            }
+            if (strcmp(node->features, wanted) != 0) {
+                forge_util_set_error(reason, reason_size,
+                          "registry features differ (resolved '%s' vs "
+                          "required '%s')",
+                          node->features[0] != '\0' ? node->features : "<none>",
+                          wanted[0] != '\0' ? wanted : "<none>");
+                return -1;
+            }
         }
         return 0;
     }
@@ -1245,6 +1353,168 @@ static int dep_identity_conflicts(const ForgeDepNode *node,
                       node->source_path, declared_canonical);
             return -1;
         }
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Registry features                                                   */
+/*                                                                     */
+/* A declaration selects features; the recipe defines them. Effective  */
+/* sets (defaults unless disabled, plus declared) are computed fresh   */
+/* from definitions, while later declarations expand against the       */
+/* defaults recorded on the existing node (definitions are gone by     */
+/* then). First declaration wins: a later set that differs conflicts   */
+/* loudly instead of rebuilding shared state mid-resolution.           */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Folds one resolved feature set into a dependency's own manifest: flag
+ * contributions append to both profiles (the sub-build picks by the
+ * consumer's options) and feature dependencies queue for the recursion.
+ * Feature tables come from the recipe parsed moments ago, so an unknown
+ * name here is an internal inconsistency, refused loudly anyway.
+ */
+static int apply_features(ForgeManifest *parsed, const ForgeFeatureDefs *defs,
+                          const char *effective,
+                          const char *dep_name, char *error, size_t error_size)
+{
+    char names[FORGE_DEP_FEATURES_MAX][FORGE_FEATURE_NAME_MAX + 1U];
+    size_t count = 0U;
+    const char *cursor = effective;
+    size_t index;
+
+    /* The effective spelling is canonical output; still bound it. */
+    while (*cursor != '\0') {
+        const char *comma = strchr(cursor, ',');
+        size_t length = comma != NULL ? (size_t)(comma - cursor) : strlen(cursor);
+
+        if (length == 0U || length > FORGE_FEATURE_NAME_MAX ||
+            count == FORGE_DEP_FEATURES_MAX) {
+            forge_util_set_error(error, error_size,
+                      "internal error: feature set for '%s' is malformed",
+                      dep_name);
+            return -1;
+        }
+        memcpy(names[count], cursor, length);
+        names[count][length] = '\0';
+        ++count;
+        cursor = comma != NULL ? comma + 1U : cursor + length;
+    }
+    for (index = 0U; index < count; ++index) {
+        const ForgeFeatureDef *def = NULL;
+        size_t slot;
+        size_t flag;
+
+        for (slot = 0U; slot < defs->count; ++slot) {
+            if (strcmp(defs->items[slot].name, names[index]) == 0) {
+                def = &defs->items[slot];
+                break;
+            }
+        }
+        if (def == NULL) {
+            forge_util_set_error(error, error_size,
+                      "internal error: feature '%s' for '%s' vanished after "
+                      "resolution", names[index], dep_name);
+            return -1;
+        }
+        for (flag = 0U; flag < def->cflag_count; ++flag) {
+            if (parsed->debug_profile.cflags.count == FORGE_MANIFEST_MAX_ITEMS ||
+                parsed->release_profile.cflags.count == FORGE_MANIFEST_MAX_ITEMS) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': feature '%s' adds more flags "
+                          "than fit", dep_name, def->name);
+                return -1;
+            }
+            (void)snprintf(parsed->debug_profile.cflags.items[parsed->debug_profile.cflags.count++],
+                           FORGE_MANIFEST_VALUE_MAX, "%s", def->cflags[flag]);
+            (void)snprintf(parsed->release_profile.cflags.items[parsed->release_profile.cflags.count++],
+                           FORGE_MANIFEST_VALUE_MAX, "%s", def->cflags[flag]);
+        }
+        for (slot = 0U; slot < def->dep_count; ++slot) {
+            const ForgeFeatureDep *want = &def->deps[slot];
+            ForgeDependency *dst;
+
+            if (parsed->dependencies.count == FORGE_MANIFEST_MAX_DEPS) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': feature '%s' adds more "
+                          "dependencies than fit", dep_name, def->name);
+                return -1;
+            }
+            /* Feature dependencies are registry-only and take the package
+             * name as their local name; collisions surface through the
+             * usual identity check. They carry no nested feature selection. */
+            dst = &parsed->dependencies.items[parsed->dependencies.count++];
+            memset(dst, 0, sizeof(*dst));
+            (void)snprintf(dst->name, sizeof(dst->name), "%s", want->package);
+            (void)snprintf(dst->registry, sizeof(dst->registry), "%s",
+                           want->package);
+            (void)snprintf(dst->registry_version, sizeof(dst->registry_version),
+                           "%s", want->version);
+            (void)snprintf(dst->registry_min_version,
+                           sizeof(dst->registry_min_version), "%s",
+                           want->min_version);
+            dst->default_features = 1;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Expands a later declaration against the defaults recorded on an existing
+ * node. Unknown names cannot be told apart from legitimate ones here; they
+ * simply never equal the recorded effective set, surfacing as a conflict
+ * that names both spellings. Fresh declarations get the precise
+ * unknown-feature error instead.
+ */
+static int expand_with_stored_defaults(const char *stored,
+                                       const ForgeDependency *dependency,
+                                       char *out, size_t out_size,
+                                       char *error, size_t error_size)
+{
+    char defaults[FORGE_DEP_FEATURES_MAX][FORGE_FEATURE_NAME_MAX + 1U];
+    char merged[FORGE_DEP_FEATURES_MAX * 2U][FORGE_FEATURE_NAME_MAX + 1U];
+    size_t ndefaults = 0U;
+    size_t nmerged = 0U;
+    const char *cursor = stored != NULL ? stored : "";
+    size_t index;
+
+    for (;;) {
+        const char *comma;
+        size_t length;
+
+        if (*cursor == '\0') {
+            break;
+        }
+        comma = strchr(cursor, ',');
+        length = comma != NULL ? (size_t)(comma - cursor) : strlen(cursor);
+        if (length == 0U || length > FORGE_FEATURE_NAME_MAX ||
+            ndefaults == FORGE_DEP_FEATURES_MAX) {
+            forge_util_set_error(error, error_size,
+                      "internal error: recorded feature defaults are malformed");
+            return -1;
+        }
+        memcpy(defaults[ndefaults], cursor, length);
+        defaults[ndefaults][length] = '\0';
+        ++ndefaults;
+        cursor = comma != NULL ? comma + 1U : cursor + length;
+    }
+    if (dependency->default_features) {
+        for (index = 0U; index < ndefaults; ++index) {
+            (void)snprintf(merged[nmerged], sizeof(merged[nmerged]), "%s",
+                           defaults[index]);
+            ++nmerged;
+        }
+    }
+    for (index = 0U; index < dependency->feature_count; ++index) {
+        (void)snprintf(merged[nmerged], sizeof(merged[nmerged]), "%s",
+                       dependency->features[index]);
+        ++nmerged;
+    }
+    if (forge_features_join(nmerged, merged, out, out_size) != 0) {
+        forge_util_set_error(error, error_size,
+                  "internal error: feature set is too large");
+        return -1;
     }
     return 0;
 }
@@ -1367,7 +1637,21 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
         int is_native;
         int dep_force;
         size_t stack_index;
+        /* Registry resolution outcome, carried to node creation below. */
+        char resolved_version[FORGE_MANIFEST_VALUE_MAX];
+        unsigned resolved_revision = 0U;
+        /* Feature spellings: declared (manifest-canonical) feeds the cache
+         * directory; effective/defaults (recipe-resolved) feed the lock,
+         * the node, and the sub-build. */
+        char declared_joined[FORGE_FEATURES_JOINED_MAX];
+        char effective_features[FORGE_FEATURES_JOINED_MAX];
+        char default_features[FORGE_FEATURES_JOINED_MAX];
+        ForgeFeatureDefs *defs = NULL;
 
+        resolved_version[0] = '\0';
+        declared_joined[0] = '\0';
+        effective_features[0] = '\0';
+        default_features[0] = '\0';
         /* Cycle check along the current path. */
         for (stack_index = 0U; (int)stack_index < depth; ++stack_index) {
             if (strcmp(names[stack_index], dependency->name) == 0) {
@@ -1480,20 +1764,42 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                    sizeof(context->error)) != 0) {
                 return -1;
             }
+            if (forge_features_join(dependency->feature_count,
+                                    dependency->features,
+                                    declared_joined,
+                                    sizeof(declared_joined)) != 0) {
+                cache_gate_release(&gate);
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "dependency '%s': feature set is too large",
+                          dependency->name);
+                return -1;
+            }
+            defs = calloc(1U, sizeof(*defs));
+            if (defs == NULL) {
+                cache_gate_release(&gate);
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "out of memory while resolving dependencies");
+                return -1;
+            }
             fetch_status = forge_registry_materialize(
                 context->logger, dependency->name, dependency->registry,
                 dependency->registry_version,
+                dependency->registry_min_version,
+                declared_joined, dependency->default_features,
                 locked != NULL ? locked->version : "",
                 locked != NULL ? locked->kind : "",
                 locked != NULL ? locked->location : "",
                 locked != NULL ? locked->ref : "",
                 locked != NULL ? locked->commit : "",
                 locked != NULL ? locked->sha256 : "",
+                locked != NULL ? locked->revision : 0U,
+                locked != NULL ? locked->features : "",
                 dep_force, context->offline, package_dir,
-                root, sizeof(root), &pin, &reused,
+                root, sizeof(root), &pin, defs, &reused,
                 context->error, sizeof(context->error));
             cache_gate_release(&gate);
             if (fetch_status != 0) {
+                free(defs);
                 return -1;
             }
             deps_log(context->logger, "deps", "resolved %s %s%s",
@@ -1504,6 +1810,47 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 forge_util_set_error(context->error, sizeof(context->error),
                           "internal error: registry pin for '%s' has no source",
                           dependency->name);
+                free(defs);
+                return -1;
+            }
+            (void)snprintf(resolved_version, sizeof(resolved_version), "%s",
+                           pin.version);
+            resolved_revision = pin.revision;
+            /*
+             * Effective features: recipe defaults (unless disabled) plus
+             * the declared request, validated against the recipe just
+             * fetched. Unknown names fail here naming what exists.
+             *
+             * A cache hit without reachable definitions (remote registry
+             * while --offline) cannot revalidate: trust the lock's
+             * recorded set, which was validated when first resolved.
+             */
+            if (reused && defs->default_count == 0U && defs->count == 0U &&
+                (dependency->feature_count != 0U ||
+                 (locked != NULL && locked->features[0] != '\0'))) {
+                if (locked == NULL ||
+                    snprintf(effective_features, sizeof(effective_features),
+                             "%s", locked->features) < 0 ||
+                    strlen(locked->features) >= sizeof(effective_features)) {
+                    free(defs);
+                    forge_util_set_error(context->error, sizeof(context->error),
+                              "dependency '%s': feature set is too large",
+                              dependency->name);
+                    return -1;
+                }
+                default_features[0] = '\0';
+            } else if (forge_features_join(defs->default_count, defs->defaults,
+                                     default_features,
+                                     sizeof(default_features)) != 0 ||
+                 forge_features_effective(defs, dependency->features,
+                                          dependency->feature_count,
+                                          dependency->default_features,
+                                          dependency->name,
+                                          effective_features,
+                                          sizeof(effective_features),
+                                          context->error,
+                                          sizeof(context->error)) != 0) {
+                free(defs);
                 return -1;
             }
 
@@ -1515,6 +1862,7 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 if (context->lock.count == FORGE_LOCK_MAX_ENTRIES) {
                     forge_util_set_error(context->error, sizeof(context->error),
                               "more than %u locked dependencies", FORGE_LOCK_MAX_ENTRIES);
+                    free(defs);
                     return -1;
                 }
                 locked = &context->lock.items[context->lock.count++];
@@ -1525,16 +1873,38 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 strcmp(locked->location, pin.location) != 0 ||
                 strcmp(locked->ref, pin.ref) != 0 ||
                 strcmp(locked->commit, pin.commit) != 0 ||
-                strcmp(locked->sha256, pin.sha256) != 0) {
+                strcmp(locked->sha256, pin.sha256) != 0 ||
+                locked->revision != pin.revision ||
+                strcmp(locked->features, effective_features) != 0) {
                 (void)snprintf(locked->kind, sizeof(locked->kind), "%s", pin.kind);
                 (void)snprintf(locked->version, sizeof(locked->version), "%s", pin.version);
                 (void)snprintf(locked->location, sizeof(locked->location), "%s", pin.location);
                 (void)snprintf(locked->ref, sizeof(locked->ref), "%s", pin.ref);
                 (void)snprintf(locked->commit, sizeof(locked->commit), "%s", pin.commit);
                 (void)snprintf(locked->sha256, sizeof(locked->sha256), "%s", pin.sha256);
+                locked->revision = pin.revision;
+                (void)snprintf(locked->features, sizeof(locked->features), "%s",
+                               effective_features);
                 context->lock_dirty = 1;
             }
             is_native = dir_has_file(root, "Forge.toml");
+            /*
+             * Feature flags only reach native sub-builds through Forge.toml
+             * profiles; on a foreign (CMake/Make) dependency they would be
+             * silently ignored, so refuse loudly instead.
+             */
+            if (!is_native && effective_features[0] != '\0') {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "dependency '%s': features ('%s') need a native "
+                          "Forge.toml dependency",
+                          dependency->name, effective_features);
+                free(defs);
+                return -1;
+            }
+            if (!is_native) {
+                free(defs);
+                defs = NULL;
+            }
         } else {
             ForgeLockEntry *locked = lock_find(&context->lock, dependency->name);
             char cache_home[FORGE_PATH_MAX];
@@ -1657,8 +2027,28 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 forge_util_prepend_error(context->error, sizeof(context->error),
                           "dependency '%s': ", dependency->name);
                 free(parsed);
+                free(defs);
                 return -1;
             }
+            /*
+             * Feature selection: fold each effective feature's flags into
+             * both profiles (the sub-build picks by the consumer's
+             * options) and queue its extra dependencies for the recursion
+             * below. Definitions came from the recipe just fetched.
+             * Skipped when a cache hit could not reach definitions
+             * (remote registry while --offline): the set still comes
+             * from the lock, and cached objects keep their flags.
+             */
+            if (effective_features[0] != '\0' && defs->count != 0U &&
+                apply_features(parsed, defs, effective_features,
+                               dependency->name,
+                               context->error, sizeof(context->error)) != 0) {
+                free(parsed);
+                free(defs);
+                return -1;
+            }
+            free(defs);
+            defs = NULL;
             names[depth][0] = '\0';
             (void)snprintf(names[depth], FORGE_DEPS_VALUE_MAX, "%s", dependency->name);
             if (resolve_recursive(context, root, parsed, depth + 1, names) != 0) {
@@ -1685,12 +2075,21 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
         node->source_ref[0] = '\0';
         node->source_path[0] = '\0';
         node->is_registry = 0;
+        node->resolved_version[0] = '\0';
+        node->resolved_revision = 0U;
         if (dependency->registry[0] != '\0') {
             (void)snprintf(node->source_url, sizeof(node->source_url), "%s",
                            dependency->registry);
             (void)snprintf(node->source_ref, sizeof(node->source_ref), "%s",
                            dependency->registry_version);
             node->is_registry = 1;
+            (void)snprintf(node->resolved_version, sizeof(node->resolved_version),
+                           "%s", resolved_version);
+            node->resolved_revision = resolved_revision;
+            (void)snprintf(node->features, sizeof(node->features), "%s",
+                           effective_features);
+            (void)snprintf(node->defaults, sizeof(node->defaults), "%s",
+                           default_features);
         } else if (dependency->git_url[0] != '\0') {
             (void)snprintf(node->source_url, sizeof(node->source_url), "%s",
                            dependency->git_url);

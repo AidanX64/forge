@@ -23,6 +23,14 @@
 # FORGE_ALLOW_UNSAFE_GIT=1 (exactly the opt-out real users would use).
 set -u
 
+replace_in_file() {
+    if sed --version >/dev/null 2>&1; then
+        sed -i "$1" "$2"
+    else
+        sed -i '' "$1" "$2"
+    fi
+}
+
 here="$(cd "$(dirname "$0")" && pwd)"
 root="$(cd "$here/.." && pwd)"
 
@@ -213,7 +221,7 @@ pinned_s2="$(git -C "$dep" rev-parse HEAD)"
 grep -q "commit = \"$pinned_s2\"" Forge.lock \
     || fail "S2: pin was not recorded"
 
-sed -i "s/commit = \"$pinned_s2\"/commit = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbe\"/" Forge.lock
+replace_in_file "s/commit = \"$pinned_s2\"/commit = \"deadbeefdeadbeefdeadbeefdeadbeefdeadbe\"/" Forge.lock
 if "$FORGE" build >"$work/out.txt" 2>&1; then
     fail "S2: tampered commit pin was accepted"
 fi
@@ -309,7 +317,7 @@ rm -f Forge.lock
 write_project_manifest "$proj/Forge.toml" "m5b" \
     "sharedm5 = { git = \"$work_forge/dep-m5a\", branch = \"master\" }" \
     "consumer = { path = \"$work_forge/lib-consumer\" }"
-sed -i "s|dep-m5b|dep-m5a|" "$consumer/Forge.toml"
+replace_in_file "s|dep-m5b|dep-m5a|" "$consumer/Forge.toml"
 git_commit_all "$consumer" "agree on the shared source"
 "$FORGE" update >/dev/null 2>&1 \
     || fail "M5: agreeing diamond was rejected"
@@ -350,6 +358,43 @@ fi
 grep -q "git = " Forge.toml \
     || fail "K1: successful add left no dependency line behind"
 pass "K1: hostile URLs rejected, escape hatch works"
+
+# ----------------------------------------------------------------------
+# K7: naming a path dependency updates nothing else (and works offline)
+# ----------------------------------------------------------------------
+dep="$work/dep-k7"
+make_dep_repo "$dep" "libk"
+branch_k="$(default_branch_of "$dep")"
+base_k="$(git -C "$dep" rev-parse HEAD)"
+
+pathlib="$work/k7-pathlib"
+mkdir -p "$pathlib"
+write_project_manifest "$pathlib/Forge.toml" "k7lib"
+
+proj="$work/proj-k7"
+mkdir -p "$proj/src"
+write_project_manifest "$proj/Forge.toml" "k7" \
+    "libk = { git = \"$work_forge/dep-k7\", branch = \"$branch_k\" }" \
+    "plib = { path = \"$work_forge/k7-pathlib\" }"
+echo 'int main(void) { return 0; }' >"$proj/src/main.c"
+cd "$proj" || exit 1
+
+"$FORGE" update >/dev/null 2>&1 \
+    || fail "K7: initial resolve failed"
+grep -q "libk = .*commit = \"$base_k\"" Forge.lock \
+    || fail "K7: initial pin for libk is missing"
+
+echo "int moved_k;" >>"$dep/src/lib.c"
+git_commit_all "$dep" "advance k past the pin"
+
+"$FORGE" update plib >/dev/null 2>&1 \
+    || fail "K7: named update of a path dependency failed"
+grep -q "libk = .*commit = \"$base_k\"" Forge.lock \
+    || fail "K7: updating a path dependency dragged libk past its pin"
+
+"$FORGE" update plib --offline >/dev/null 2>&1 \
+    || fail "K7: named path-dependency update must work offline"
+pass "K7: named path-dependency updates touch nothing else, even offline"
 
 echo "all dependency regressions passed"
 rm -rf "$work"

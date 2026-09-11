@@ -142,6 +142,9 @@ forge clean              # remove the project's target/ output
 forge add mylib --git https://github.com/example/mylib
                           # add a dependency, resolve it, and pin it
 forge add local --path ../local
+forge add hello --registry hello-c --version 0.1.0
+                          # add a registry package (needs FORGE_REGISTRY_URL;
+                          # without --version the newest release is pinned)
 forge update mylib       # re-resolve one dep; `forge update` does all of them
 forge remove mylib       # drop the entry and its lock pin
 forge run --manifest path/to/Forge.toml
@@ -254,7 +257,21 @@ registry**, like CPM, Meson wrapdb, and vcpkg all do in their own way:
 [dependencies]
 hello_lib = { path = "../libhello" }
 coolib    = { git = "https://github.com/example/coolib", tag = "v1.2" }   # branch/rev also work
+serde_c   = { registry = "serde-c", version = "0.1.0" }                   # exact pin, never moves
+serde_d   = { registry = "serde-d", min-version = "0.2.0" }                # minimum, floats within [min, newest]
+serde_e   = { registry = "serde-e" }                                      # bare: tracks the registry baseline
 ```
+
+- Registry deps are versioned recipes, vcpkg-style: the registry's
+  `baseline.json` pins the minimum (version, revision) per package.
+  Exact `version` pins bypass the baseline and never move (only the
+  manifest moves them); `min-version` and bare entries resolve no lower
+  than the floor, and `forge update` moves them to newest. The resolved
+  recipe revision rides along in `Forge.lock`, so a recipe fix without a
+  new upstream release updates cleanly instead of tripping the
+  tamper gate — while same-version bytes that change under a pin are
+  still refused loudly. A lockfile from before revisions (no `revision`
+  key) keeps resolving byte-identically.
 
 - Git deps are cloned into a shared cache (`~/.forge/git`, override with
   `FORGE_HOME`) and pinned by resolved commit SHA in a generated `Forge.lock`
@@ -294,6 +311,9 @@ Dependencies can be managed without hand-editing the manifest, Cargo-style:
 ```sh
 forge add mylib --git https://github.com/example/mylib --tag v1.2
 forge add utils --path ../utils      # path deps are used in place, never cached
+forge add hello --registry hello-c --version 0.1.0   # exact pin
+forge add hello --registry hello-c --min-version 0.1.0   # minimum
+forge add hello --registry hello-c   # bare: tracks the baseline
 forge update mylib                   # pull just this dep to its newest allowed state
 forge remove mylib                   # drop the entry and prune its lock pin
 ```
@@ -302,9 +322,43 @@ forge remove mylib                   # drop the entry and prune its lock pin
 the manifest (including comments and formatting), resolves the dependency
 immediately so `Forge.lock` gains its pin, and rolls the edit back if
 resolution fails (a bad URL or missing path never leaves a half-added dep).
-Exactly one source (`--git` / `--path`) is accepted; git sources may pin at
-most one ref (`--tag`, `--branch`, or `--rev`). `remove` errors on unknown
+Exactly one source (`--git` / `--path` / `--registry`) is accepted; git
+sources may pin at most one ref (`--tag`, `--branch`, or `--rev`), registry
+sources at most one `version` (`--version`). `remove` errors on unknown
 names, listing the dependencies that do exist.
+
+### Registry dependencies
+
+Next to VCS sources, forge resolves source recipes from a sunn registry
+(`FORGE_REGISTRY_URL`, e.g. `https://sunn.local`):
+
+```toml
+[dependencies]
+hello = { registry = "hello-c", version = "0.1.0" }
+```
+
+- The registry maps `name@version` to either an upstream Git repository and
+  ref, or a source archive URL and required sha256. Git recipes are checked
+  out through the same shared Git cache as plain Git dependencies; URL
+  recipes are verified before extraction. Registry pins use an explicit
+  source kind in `Forge.lock`.
+  A versioned entry never moves under `forge update` (only the manifest
+  moves it); an unversioned `registry = "name"` entry tracks the newest
+  release instead.
+- Every URL download is checksum-verified before unpacking. Optional registry
+  patches are fetched from `<registry>/patches/<name>` and applied before
+  build-system detection. A recipe changed under a locked version fails
+  loudly instead of following. `--offline` reuses warm checkouts only; `--locked` refuses
+  any pin move — the same contract as git deps.
+- Transports mirror the git allowlist: `https://` always, `http://` only
+  for loopback, `file://` only with `FORGE_ALLOW_UNSAFE_REGISTRY=1`
+  (local mirrors and the regression suite use it; a `file://` base
+  points at the site root, same as `https://`).
+- Downloads shell out to `curl` (PowerShell `Invoke-WebRequest` as a
+  Windows fallback) and unpack with `tar` — no new libraries. On
+  MSYS2/Git-Bash shells, make sure *native* curl/tar come first on PATH:
+  the MSYS `/usr/bin/tar` cannot run as a grandchild of a native
+  process (its gzip helper will not spawn).
 
 Lock hygiene is automatic: entries for dependencies that disappear from the
 manifest (directly removed, or dropped by a transitive consumer) are pruned

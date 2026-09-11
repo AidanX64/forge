@@ -8,6 +8,13 @@
 #include "forge/manifest.h"
 #include "forge/paths.h"
 
+/*
+ * Shared dependency cache root: $FORGE_HOME, or ~/.forge when unset
+ * (USERPROFILE on Windows). Git checkouts live under <root>/git,
+ * registry packages under <root>/registry. Returns 0 on success.
+ */
+int forge_deps_cache_home(char *destination, size_t destination_size);
+
 #define FORGE_DEPS_MAX_NODES 128U
 #define FORGE_DEPS_MAX_DEPTH 32U
 
@@ -23,11 +30,24 @@ typedef struct ForgeDepNode {
     /* Source identity, kept so two declarations of the same dependency name
      * with different sources fail loudly instead of first-one-wins. For git
      * deps `source_url`/`source_ref` hold the manifest strings and
-     * `source_root` is empty; for path deps `source_root` holds the
-     * canonicalized directory and the other two are empty. */
+     * `source_root` is empty; for registry deps they hold the package name
+     * and pinned version (`is_registry` set); for path deps `source_root`
+     * holds the canonicalized directory and the other two are empty. */
     char source_url[FORGE_MANIFEST_VALUE_MAX];
     char source_ref[FORGE_MANIFEST_VALUE_MAX];
     char source_path[FORGE_PATH_MAX];
+    int is_registry;
+    /* Registry nodes only: the resolved (version, revision) pair, so a
+     * later declaration carrying an exact pin or a minimum can be checked
+     * against what actually resolved rather than the declared spelling. */
+    char resolved_version[FORGE_MANIFEST_VALUE_MAX];
+    unsigned resolved_revision;
+    /* Registry nodes only: canonical comma-joined feature sets. `features`
+     * is the effective set the node builds with; `defaults` is the recipe's
+     * default set, kept so later declarations expand against the same
+     * recipe view (definitions are gone by then). */
+    char features[FORGE_FEATURES_JOINED_MAX];
+    char defaults[FORGE_FEATURES_JOINED_MAX];
     ForgeManifest *manifest;
     int is_native;
     /* Filled by the build stage: native deps point at their objects.txt
@@ -50,6 +70,15 @@ typedef struct ForgeDepGraph {
  * human-readable reason in `error`.
  */
 int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_size);
+
+/* Shared Git materialization primitive used by plain and registry sources. */
+int forge_deps_ensure_git_checkout(ForgeLogger *logger, const char *name,
+                                   const char *url, const char *ref,
+                                   const char *locked_commit, int force_update,
+                                   int submodules, int offline,
+                                   const char *cache_dir, char *resolved_sha,
+                                   size_t resolved_sha_size, char *error,
+                                   size_t error_size);
 
 /*
  * Resolves the manifest's [dependencies] transitively: fetches git deps into

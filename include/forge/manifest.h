@@ -12,14 +12,34 @@ typedef struct ForgeStringList {
     size_t count;
 } ForgeStringList;
 
-/* One entry of [dependencies]: either a path dependency or a git dependency
- * pinned by ref (tag, branch, or rev); the lockfile records the resolved
- * commit. */
+/* One entry of [dependencies]: a path dependency, a git dependency
+ * pinned by ref (tag, branch, or rev), or a registry dependency pinned
+ * by version; the lockfile records the resolved commit / checksum. */
+#define FORGE_DEP_FEATURES_MAX 8U
+#define FORGE_FEATURE_NAME_MAX 32U
+/* Canonical comma-joined feature sets never exceed 8 names of 32
+ * characters; larger inputs fail before they reach a fixed buffer. */
+#define FORGE_FEATURES_JOINED_MAX 512U
+/* Canonical comma-joined feature sets never exceed 8 names of 32
+ * characters; larger inputs fail before they reach a fixed buffer. */
+#define FORGE_FEATURES_JOINED_MAX 512U
 typedef struct ForgeDependency {
     char name[FORGE_MANIFEST_VALUE_MAX];
     char git_url[FORGE_MANIFEST_VALUE_MAX];
     char ref[FORGE_MANIFEST_VALUE_MAX];
     char path[FORGE_MANIFEST_VALUE_MAX];
+    /* Registry deps only: package name on the registry and wanted version
+     * ("" tracks the newest allowed state, like an unpinned git ref). */
+    char registry[FORGE_MANIFEST_VALUE_MAX];
+    char registry_version[FORGE_MANIFEST_VALUE_MAX];
+    /* Registry deps only: minimum acceptable version, exclusive with the
+     * exact pin above; "" means none. */
+    char registry_min_version[FORGE_MANIFEST_VALUE_MAX];
+    /* Registry deps only: requested feature names, validated against the
+     * recipe after fetch; defaults apply unless default_features is 0. */
+    char features[FORGE_DEP_FEATURES_MAX][FORGE_FEATURE_NAME_MAX + 1U];
+    size_t feature_count;
+    int default_features;
     /* Git deps only: clone/update git submodules alongside the checkout. */
     int submodules;
 } ForgeDependency;
@@ -56,5 +76,27 @@ typedef struct ForgeManifest {
 /* Loads the supported Forge.toml subset. Returns 0 on success. */
 int forge_manifest_load(const char *path, ForgeManifest *manifest,
                         char *error, size_t error_size);
+
+/* Feature names for registry dependencies: 1-32 of letters, digits, '-',
+ * '_' (no dots). Returns 1 when valid, 0 otherwise. */
+int forge_feature_name_is_valid(const char *name);
+
+/*
+ * Splits a comma-separated feature list ("ssl, http") into dependency
+ * slots in canonical (sorted, deduplicated) order. Used by the manifest
+ * parser, the lockfile reader, and `forge add` so every spelling
+ * normalizes identically. `name` names the dependent for diagnostics.
+ * Returns 0 on success.
+ */
+int forge_parse_feature_list(const char *name, const char *text,
+                             ForgeDependency *dependency,
+                             char *error, size_t error_size);
+/*
+ * Total semver precedence for validated versions: numeric MAJOR/MINOR/PATCH,
+ * releases outranking pre-releases, pre-release identifiers per semver 11.4;
+ * "+build" suffixes are ignored. Returns -1 when a < b, 0 when equal,
+ * 1 when a > b.
+ */
+int forge_version_compare(const char *a, const char *b);
 
 #endif

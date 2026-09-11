@@ -50,16 +50,22 @@ endif
 BIN := $(TARGET_DIR)/forge$(EXE)
 SOURCES := $(wildcard src/*.c)
 OBJECTS := $(SOURCES:src/%.c=$(TARGET_DIR)/%.o)
+DEPFILES := $(OBJECTS:.o=.d)
 
-.PHONY: all clean test install uninstall
+.PHONY: all clean test install uninstall regression
 
 all: $(BIN)
 
 $(TARGET_DIR):
 	$(call make_directory,$(TARGET_DIR))
 
+# Header tracking, the same -MMD approach forge uses for the projects it
+# builds: editing a header recompiles exactly the objects that include it.
+# (Without this, struct changes in include/ silently kept stale objects.)
 $(TARGET_DIR)/%.o: src/%.c | $(TARGET_DIR)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+-include $(DEPFILES)
 
 $(BIN): $(OBJECTS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
@@ -79,3 +85,21 @@ clean:
 
 test: all
 	$(BIN) --help
+
+# The regression suites are bash scripts. Native-Windows make drives recipes
+# through cmd.exe, where bare "bash" resolves to the WSL launcher and dies
+# without a distro installed; probe the common Git-for-Windows/MSYS2 spots
+# first (space-free short paths so $(wildcard) can match them).
+ifeq ($(OS),Windows_NT)
+GIT_BASH := $(firstword $(wildcard C:/Progra~1/Git/bin/bash.exe) \
+                        $(wildcard C:/msys64/usr/bin/bash.exe))
+BASH := $(if $(GIT_BASH),$(GIT_BASH),bash)
+else
+BASH := bash
+endif
+
+# Sandbox dependency/engine regression suites (see test/*.sh headers).
+regression: all
+	"$(BASH)" test/deps-regression.sh
+	"$(BASH)" test/registry-regression.sh
+	"$(BASH)" test/regression.sh

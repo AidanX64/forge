@@ -67,7 +67,9 @@ as possible, regardless of target OS, architecture, or toolchain.
 `test/` is the canonical fixture (`test/Forge.toml`, a C project that prints
 "Hello world!"). Run it after every change so your mental model matches CI:
 
-1. `make clean && make CC=gcc` — clean full build of forge.
+1. `make clean && make CC=gcc` — clean full build of forge. (Always clean
+   after touching `include/`: this Makefile now tracks headers with -MMD,
+   but a clean build is still the ground truth.)
 2. `build/forge.exe run --release --manifest test/Forge.toml` — expect
    `Hello world!` (Linux/macOS: `build/forge run --release`).
 3. Repeat step 2 and expect *no* recompiles — the rerun log lists
@@ -75,6 +77,9 @@ as possible, regardless of target OS, architecture, or toolchain.
    regression check.
 4. `cd test && forge run` — exercises manifest discovery and
    project-root anchoring from a plain working directory.
+5. `make regression` — the bash suites (`deps`, `registry`, engine). The
+   registry suite builds a hermetic file:// stub, so dependency changes
+   need it even when the fixture above is green.
 
 ### Subcommand conventions
 - Subcommands: `build`, `check`, `run`, `test`, `debug`, `clean`, `update`,
@@ -98,9 +103,10 @@ as possible, regardless of target OS, architecture, or toolchain.
   code; keep that contract for anything that spawns user programs.
 - `forge test` builds each `tests/*.c` as a self-contained binary (own
   `main`); missing/empty `tests/` exits 0.
-- `[dependencies]` supports path deps and git deps pinned by commit in a
-  generated `Forge.lock`; foreign deps are detected as CMake or Make and
-  must produce a static library.
+- `[dependencies]` supports path deps, git deps pinned by commit in a
+  generated `Forge.lock`, and registry deps (`registry = "name"` with an
+  optional `version`) pinned by version + tarball sha256; foreign deps are
+  detected as CMake or Make and must produce a static library.
 - The forge version string lives in `include/forge/version.h`.
 
 ### Incremental-build caveats

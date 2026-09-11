@@ -22,10 +22,22 @@ int forge_orchestrate_test(const char *manifest_path, const ForgeBuildOptions *o
  * `offline` forbids network access (cached pins still resolve). */
 int forge_orchestrate_update(const char *manifest_path, const char *only_name,
                              int offline);
-/* Adds a [dependencies] entry (git or path source) and re-resolves pins. */
+/* Adds a [dependencies] entry (git, path, or registry source) and
+ * re-resolves pins. `registry_version` pins one release exactly;
+ * `registry_min_version` sets a minimum ("" for both tracks the registry
+ * baseline, newest when the registry states none). `registry_features`
+ * is a comma-separated feature request ("" for none);
+ * `registry_no_default_features` disables recipe defaults. At most one of
+ * version/min-version may be non-empty, and features need a registry
+ * source. */
 int forge_orchestrate_add(const char *manifest_path, const char *name,
                           const char *git_url, const char *ref_kind,
-                          const char *ref_value, const char *dep_path);
+                          const char *ref_value, const char *dep_path,
+                          const char *registry_package,
+                          const char *registry_version,
+                          const char *registry_min_version,
+                          const char *registry_features,
+                          int registry_no_default_features);
 /* Removes a [dependencies] entry and prunes its pin from Forge.lock. */
 int forge_orchestrate_remove(const char *manifest_path, const char *name);
 int forge_orchestrate_debug(const char *manifest_path, const ForgeBuildOptions *options);

@@ -99,6 +99,16 @@ jobs:
           echo "rerun log: $log"
           test "$(grep -c '\[compile\] source:' "$log")" = "0"
 
+      # Dependency and engine regression suites (sandboxed, self-contained).
+      - name: Dependency + engine regressions (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: msys2 {0}
+        run: make regression CC=gcc
+
+      - name: Dependency + engine regressions (Linux/macOS)
+        if: matrix.os != 'windows-latest'
+        run: make regression CC=${{ matrix.compiler }}
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
