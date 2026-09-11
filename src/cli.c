@@ -24,8 +24,11 @@ static void print_usage(FILE *stream)
             "                        re-resolve deps (one, or all when NAME is omitted)\n"
             "  forge add <NAME> --git URL [--tag T | --branch B | --rev R]\n"
             "  forge add <NAME> --path DIR      [--manifest PATH]\n"
+            "  forge add <NAME> --registry PKG [--version VER]\n"
             "      git URLs accept https://, ssh://, and git@host:path;\n"
             "      FORGE_ALLOW_UNSAFE_GIT=1 lifts that restriction\n"
+            "      registry packages come from FORGE_REGISTRY_URL recipes and\n"
+            "      pin their upstream source in Forge.lock\n"
             "  forge remove <NAME> [--manifest PATH]\n"
             "  forge new <NAME>      scaffold a new project directory\n"
             "  forge init            scaffold into the current directory\n"
@@ -39,6 +42,8 @@ static void print_usage(FILE *stream)
             "  --frozen              --offline and --locked together\n"
             "Environment:\n"
             "  FORGE_HOME                    dependency cache root (default ~/.forge)\n"
+            "  FORGE_REGISTRY_URL            sunn registry for --registry deps\n"
+            "  FORGE_ALLOW_UNSAFE_REGISTRY=1 permit file:// registry URLs\n"
             "  FORGE_DEBUGGER                debugger executable for `forge debug`\n"
             "  FORGE_ALLOW_UNSAFE_GIT=1      permit local-path/file:// git URLs\n"
             "  NO_COLOR                      disable colored status lines\n"
@@ -73,10 +78,11 @@ static const ForgeVerbHelp VERB_HELP[] = {
       "Re-resolve dependencies: bare, every dep moves to the newest allowed "
       "state; naming one moves only that dep past its pin. --offline forbids "
       "network access." },
-    { "add", "forge add <NAME> (--git URL | --path DIR) "
-             "[--tag T | --branch B | --rev R] [--manifest PATH]",
+    { "add", "forge add <NAME> (--git URL | --path DIR | --registry PKG) "
+             "[--tag T | --branch B | --rev R] [--version VER] [--manifest PATH]",
       "Insert a dependency into [dependencies]; git URLs must use https://, "
-      "ssh://, or git@host:path." },
+      "ssh://, or git@host:path; --version pins a registry package (latest "
+      "when omitted)." },
     { "remove", "forge remove <NAME> [--manifest PATH]",
       "Remove a dependency from [dependencies] and its lock entry." },
     { "new", "forge new <NAME>",
@@ -303,14 +309,17 @@ static int command_build_like(const char *command, int argc, char **argv)
                                  program_arguments, program_argument_count);
 }
 
-/* forge add NAME (--git URL | --path DIR) [--tag T|--branch B|--rev R]
- * [--manifest PATH]. Exactly one source; at most one ref, git-only. */
+/* forge add NAME (--git URL | --path DIR | --registry PKG)
+ * [--tag T|--branch B|--rev R] [--version VER] [--manifest PATH].
+ * Exactly one source; refs are git-only, versions registry-only. */
 static int command_add(int argc, char **argv)
 {
     const char *manifest_path = "Forge.toml";
     const char *name = NULL;
     const char *git_url = NULL;
     const char *dep_path = NULL;
+    const char *registry_package = NULL;
+    const char *registry_version = "";
     const char *ref_kind = "";
     const char *ref_value = "";
     char discovered[FORGE_PATH_MAX];
@@ -335,6 +344,16 @@ static int command_add(int argc, char **argv)
                 return 1;
             }
             dep_path = argv[++index];
+        } else if (strcmp(argv[index], "--registry") == 0) {
+            if (flag_value_missing("--registry", index, argc)) {
+                return 1;
+            }
+            registry_package = argv[++index];
+        } else if (strcmp(argv[index], "--version") == 0) {
+            if (flag_value_missing("--version", index, argc)) {
+                return 1;
+            }
+            registry_version = argv[++index];
         } else if (strcmp(argv[index], "--tag") == 0 ||
                    strcmp(argv[index], "--branch") == 0 ||
                    strcmp(argv[index], "--rev") == 0) {
@@ -362,7 +381,9 @@ static int command_add(int argc, char **argv)
     }
     discover_manifest(&manifest_path, explicit_manifest, discovered, sizeof(discovered));
     return forge_orchestrate_add(manifest_path, name, git_url != NULL ? git_url : "",
-                                 ref_kind, ref_value, dep_path != NULL ? dep_path : "");
+                                 ref_kind, ref_value, dep_path != NULL ? dep_path : "",
+                                 registry_package != NULL ? registry_package : "",
+                                 registry_version);
 }
 
 static int command_remove(int argc, char **argv)

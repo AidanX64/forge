@@ -16,6 +16,7 @@
 #if FORGE_PLATFORM_WINDOWS
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <fcntl.h>
 #include <io.h>
 #else
 #include <fcntl.h>
@@ -28,20 +29,27 @@
 #include "forge/argv.h"
 #include "forge/deps.h"
 #include "forge/process.h"
+#include "forge/registry.h"
 #include "forge/thread.h"
 #include "forge_util.h"
 
 #define FORGE_DEPS_VALUE_MAX FORGE_MANIFEST_VALUE_MAX
 #define FORGE_LOCK_MAX_ENTRIES FORGE_MANIFEST_MAX_DEPS
 #define FORGE_SCAN_ENTRY_LIMIT 20000U
+#define FORGE_SCAN_MAX_DEPTH 64U
 #define FORGE_LOCK_LINE_MAX 4096U
 
-/* One pinned git dependency as recorded in Forge.lock. */
+/* One pinned dependency as recorded in Forge.lock. Plain git entries retain
+ * their historical shape; registry entries carry an explicit source kind. */
 typedef struct ForgeLockEntry {
     char name[FORGE_DEPS_VALUE_MAX];
     char commit[FORGE_DEPS_VALUE_MAX];
-    char url[FORGE_DEPS_VALUE_MAX];
+    char url[FORGE_PATH_MAX];
     char ref[FORGE_DEPS_VALUE_MAX];
+    char version[FORGE_DEPS_VALUE_MAX];
+    char sha256[FORGE_DEPS_VALUE_MAX];
+    char kind[8];
+    char location[FORGE_PATH_MAX];
 } ForgeLockEntry;
 
 typedef struct ForgeLockFile {
@@ -89,6 +97,14 @@ static int forge_home_root(char *destination, size_t destination_size)
     }
     return snprintf(destination, destination_size, "%s/.forge", home) >= 0 &&
            strlen(home) + 7U < destination_size ? 0 : -1;
+}
+
+int forge_deps_cache_home(char *destination, size_t destination_size)
+{
+    if (destination == NULL || destination_size == 0U) {
+        return -1;
+    }
+    return forge_home_root(destination, destination_size);
 }
 
 /* FNV-1a over the URL keeps cache directories unique per source. */
@@ -239,6 +255,102 @@ static int scheme_matches(const char *url, size_t length, const char *name)
  *
  * Everything else is refused loudly rather than handed to git.
  */
+/* Validates the authority section of an https:// or ssh:// URL so a crafted
+ * host cannot turn into an ssh option: `ssh://-oProxyCommand=.../x` would
+ * otherwise reach `git clone` (a lone argv element, so no shell is involved)
+ * and git would hand the `-o...` host to ssh as a command-line flag.
+ * Grammar: [user@]host[:port], host non-empty, never starting with '-'. */
+static int url_authority_is_safe(const char *url, size_t scheme_length)
+{
+    const char *cursor = url + scheme_length;
+    const char *host;
+    const char *end;
+
+    /* Skip "://". */
+    if (cursor[0] != ':' || cursor[1] != '/' || cursor[2] != '/') {
+        return 0;
+    }
+    cursor += 3U;
+    /* Strip optional userinfo: [user@]. */
+    for (end = cursor; *end != '\0' && *end != '/' && *end != '?' && *end != '#'; ++end) {
+        if (*end == '@') {
+            const char *user;
+
+            for (user = cursor; user < end; ++user) {
+                unsigned char c = (unsigned char)*user;
+
+                if (!(isalnum(c) || c == '.' || c == '-' || c == '_' ||
+                      c == '~' || c == '+')) {
+                    return 0;
+                }
+            }
+            cursor = end + 1;
+            break;
+        }
+    }
+    host = cursor;
+    if (host[0] == '[') {
+        /* Bracketed IPv6 literal: [::1], optionally followed by :port. */
+        const char *close = strchr(host, ']');
+        const char *port;
+
+        if (close == NULL || close == host + 1U) {
+            return 0;
+        }
+        for (cursor = host + 1U; cursor < close; ++cursor) {
+            unsigned char c = (unsigned char)*cursor;
+
+            if (!(isxdigit(c) || c == ':' || c == '.')) {
+                return 0;
+            }
+        }
+        if (*close == ']' && close[1] != ':' && close[1] != '\0' &&
+            close[1] != '/' && close[1] != '?' && close[1] != '#') {
+            return 0;
+        }
+        if (close[1] != ':') {
+            return 1;
+        }
+        port = close + 2U;
+        if (*port == '\0') {
+            return 0;
+        }
+        for (; *port != '\0' && *port != '/' && *port != '?' && *port != '#'; ++port) {
+            if (!isdigit((unsigned char)*port)) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    for (end = host; *end != '\0' && *end != '/' && *end != '?' && *end != '#'; ++end) {
+        if (*end == ':') {
+            /* Port: digits only, non-empty. */
+            const char *port = end + 1;
+
+            if (*port == '\0') {
+                return 0;
+            }
+            for (; *port != '\0' && *port != '/' && *port != '?' && *port != '#'; ++port) {
+                if (!isdigit((unsigned char)*port)) {
+                    return 0;
+                }
+            }
+            break;
+        }
+    }
+    if (end == host || host[0] == '-') {
+        return 0;
+    }
+    for (; host < end; ++host) {
+        unsigned char c = (unsigned char)*host;
+
+        if (!(isalnum(c) || c == '.' || c == '-' || c == '_')) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_size)
 {
     static const char *const rejection =
@@ -288,6 +400,12 @@ int forge_deps_git_url_is_supported(const char *url, char *error, size_t error_s
          * schemes bypass the cache policy, http:// clones insecurely. */
         if ((scheme_length == 5U && scheme_matches(url, scheme_length, "https")) ||
             (scheme_length == 3U && scheme_matches(url, scheme_length, "ssh"))) {
+            if (!url_authority_is_safe(url, scheme_length)) {
+                forge_util_set_error(error, error_size,
+                          "git URL '%s' has an unusable host; %s", url,
+                          rejection);
+                return -1;
+            }
             return 0;
         }
         forge_util_set_error(error, error_size,
@@ -439,12 +557,13 @@ static void discard_cache_dir(const char *cache_dir)
  * a matching lock pin still checks out locally, anything else fails here,
  * before git can run.
  */
-static int ensure_git_checkout(ForgeLogger *logger, const char *name, const char *url,
-                               const char *ref, const char *locked_commit,
-                               int force_update, int submodules, int offline,
-                               const char *cache_dir,
-                               char *resolved_sha, size_t resolved_sha_size,
-                               char *error, size_t error_size)
+int forge_deps_ensure_git_checkout(ForgeLogger *logger, const char *name,
+                                   const char *url, const char *ref,
+                                   const char *locked_commit, int force_update,
+                                   int submodules, int offline,
+                                   const char *cache_dir,
+                                   char *resolved_sha, size_t resolved_sha_size,
+                                   char *error, size_t error_size)
 {
     char capture[FORGE_PATH_MAX];
     char origin_target[FORGE_DEPS_VALUE_MAX + 8U];
@@ -647,9 +766,23 @@ static int write_lockfile_body(void *user_data, FILE *file)
     for (index = 0U; index < lock->count; ++index) {
         const ForgeLockEntry *entry = &lock->items[index];
 
-        if (fprintf(file, "%s = { commit = \"%s\", url = \"%s\", ref = \"%s\" }\n",
-                    entry->name, entry->commit, entry->url, entry->ref) < 0) {
-            return -1;
+        if (entry->commit[0] != '\0') {
+            if (entry->kind[0] != '\0') {
+                if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", ref = \"%s\", commit = \"%s\" }\n",
+                            entry->name, entry->kind, entry->version,
+                            entry->location, entry->ref, entry->commit) < 0) {
+                    return -1;
+                }
+            } else if (fprintf(file, "%s = { commit = \"%s\", url = \"%s\", ref = \"%s\" }\n",
+                        entry->name, entry->commit, entry->url, entry->ref) < 0) {
+                return -1;
+            }
+        } else {
+            if (fprintf(file, "%s = { kind = \"%s\", version = \"%s\", location = \"%s\", sha256 = \"%s\" }\n",
+                        entry->name, entry->kind, entry->version,
+                        entry->location, entry->sha256) < 0) {
+                return -1;
+            }
         }
     }
     return 0;
@@ -668,6 +801,25 @@ static int is_full_git_sha(const char *text)
         return 0;
     }
     for (index = 0U; index < 40U; ++index) {
+        unsigned char character = (unsigned char)text[index];
+
+        if (!((character >= '0' && character <= '9') ||
+              (character >= 'a' && character <= 'f'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Registry pins carry a SHA-256 instead of a commit: 64 lowercase hex. */
+static int is_full_sha256(const char *text)
+{
+    size_t index;
+
+    if (text == NULL || strlen(text) != 64U) {
+        return 0;
+    }
+    for (index = 0U; index < 64U; ++index) {
         unsigned char character = (unsigned char)text[index];
 
         if (!((character >= '0' && character <= '9') ||
@@ -776,25 +928,82 @@ static int load_lockfile(const char *path, ForgeLockFile *lock,
                 (void)snprintf(entry->url, sizeof(entry->url), "%s", value);
             } else if (strcmp(key_start, "ref") == 0) {
                 (void)snprintf(entry->ref, sizeof(entry->ref), "%s", value);
+            } else if (strcmp(key_start, "version") == 0) {
+                (void)snprintf(entry->version, sizeof(entry->version), "%s", value);
+            } else if (strcmp(key_start, "sha256") == 0) {
+                (void)snprintf(entry->sha256, sizeof(entry->sha256), "%s", value);
+            } else if (strcmp(key_start, "kind") == 0) {
+                (void)snprintf(entry->kind, sizeof(entry->kind), "%s", value);
+            } else if (strcmp(key_start, "location") == 0) {
+                (void)snprintf(entry->location, sizeof(entry->location), "%s", value);
             }
             cursor = quote + 1;
         }
+        if (entry->kind[0] != '\0') {
+            if ((strcmp(entry->kind, "git") == 0 &&
+                 (entry->version[0] == '\0' || entry->location[0] == '\0' ||
+                  entry->ref[0] == '\0' || !is_full_git_sha(entry->commit))) ||
+                (strcmp(entry->kind, "url") == 0 &&
+                 (entry->version[0] == '\0' || entry->location[0] == '\0' ||
+                  !is_full_sha256(entry->sha256) || entry->commit[0] != '\0')) ||
+                (strcmp(entry->kind, "git") != 0 && strcmp(entry->kind, "url") != 0)) {
+                forge_util_set_error(error, error_size,
+                          "%s: dependency '%s' has a malformed registry pin; "
+                          "delete Forge.lock and run 'forge update' to regenerate it",
+                          path, entry->name);
+                (void)fclose(file);
+                return -1;
+            }
+            continue;
+        }
+        if (entry->commit[0] != '\0') {
+            /*
+             * S2 gate: the pin is handed to `git checkout --detach` verbatim, and
+             * every value forge writes is a full lowercase SHA from rev-parse.
+             * Anything else here is a hand-edit or corruption; refuse it loudly
+             * instead of checking out whatever git resolves the string to.
+             */
+            if (!is_full_git_sha(entry->commit)) {
+                forge_util_set_error(error, error_size,
+                          "%s: dependency '%s' has a malformed commit pin '%s' "
+                          "(expected 40 hex digits); delete Forge.lock and run "
+                          "'forge update' to regenerate it",
+                          path, entry->name,
+                          entry->commit[0] != '\0' ? entry->commit : "<missing>");
+                (void)fclose(file);
+                return -1;
+            }
+            if (entry->version[0] != '\0' || entry->sha256[0] != '\0') {
+                forge_util_set_error(error, error_size,
+                          "%s: dependency '%s' mixes git and registry pins; "
+                          "delete Forge.lock and run 'forge update' to "
+                          "regenerate it",
+                          path, entry->name);
+                (void)fclose(file);
+                return -1;
+            }
+            continue;
+        }
         /*
-         * S2 gate: the pin is handed to `git checkout --detach` verbatim, and
-         * every value forge writes is a full lowercase SHA from rev-parse.
-         * Anything else here is a hand-edit or corruption; refuse it loudly
-         * instead of checking out whatever git resolves the string to.
+         * Registry pins mirror the S2 gate: the sha256 is compared against
+         * downloaded bytes verbatim, so a hand-edited or corrupt pin must
+         * fail here rather than fetching whatever the tampered entry says.
          */
-        if (!is_full_git_sha(entry->commit)) {
+        if (entry->version[0] != '\0' && entry->url[0] != '\0' &&
+            is_full_sha256(entry->sha256)) {
             forge_util_set_error(error, error_size,
-                      "%s: dependency '%s' has a malformed commit pin '%s' "
-                      "(expected 40 hex digits); delete Forge.lock and run "
-                      "'forge update' to regenerate it",
-                      path, entry->name,
-                      entry->commit[0] != '\0' ? entry->commit : "<missing>");
+                      "%s: dependency '%s' uses the old registry artifact "
+                      "lock format; regenerate your lockfile with 'forge update'",
+                      path, entry->name);
             (void)fclose(file);
             return -1;
         }
+        forge_util_set_error(error, error_size,
+                  "%s: dependency '%s' has a malformed lock pin; delete "
+                  "Forge.lock and run 'forge update' to regenerate it",
+                  path, entry->name);
+        (void)fclose(file);
+        return -1;
     }
     (void)fclose(file);
     return 0;
@@ -938,19 +1147,51 @@ static int consumer_root_is_cached(const char *consumer_root)
 
 /*
  * Two declarations of the same dependency name may only coexist when they
- * name the same source: identical git URL and ref pair, or the same resolved
- * directory for path deps. Anything else used to silently resolve to
- * whichever declaration came first, hiding real conflicts behind build-order
- * luck. Returns 0 when the sources agree, -1 with a short explanation of the
- * difference in `reason`.
+ * name the same source: identical git URL and ref pair, identical registry
+ * package and version, or the same resolved directory for path deps.
+ * Anything else used to silently resolve to whichever declaration happened
+ * to resolve first. Returns 0 when the sources agree, -1 with a short
+ * explanation of the difference in `reason`.
  */
 static int dep_identity_conflicts(const ForgeDepNode *node,
                                   const ForgeDependency *dependency,
                                   const char *consumer_root,
                                   char *reason, size_t reason_size)
 {
-    int node_is_git = node->source_url[0] != '\0';
+    int node_is_git = !node->is_registry && node->source_url[0] != '\0';
     int dependency_is_git = dependency->git_url[0] != '\0';
+    int dependency_is_registry = dependency->registry[0] != '\0';
+
+    if (node->is_registry != dependency_is_registry) {
+        forge_util_set_error(reason, reason_size,
+                  "one declaration uses %s '%s', the other %s '%s'",
+                  node->is_registry ? "registry" :
+                  node_is_git ? "git" : "path",
+                  node->is_registry ? node->source_url :
+                  node_is_git ? node->source_url : node->source_path,
+                  dependency_is_registry ? "registry" :
+                  dependency_is_git ? "git" : "path",
+                  dependency_is_registry ? dependency->registry :
+                  dependency_is_git ? dependency->git_url : dependency->path);
+        return -1;
+    }
+    if (node->is_registry) {
+        if (strcmp(node->source_url, dependency->registry) != 0) {
+            forge_util_set_error(reason, reason_size,
+                      "registry packages differ ('%s' vs '%s')",
+                      node->source_url, dependency->registry);
+            return -1;
+        }
+        if (strcmp(node->source_ref, dependency->registry_version) != 0) {
+            forge_util_set_error(reason, reason_size,
+                      "registry versions differ ('%s' vs '%s')",
+                      node->source_ref[0] != '\0' ? node->source_ref : "<latest>",
+                      dependency->registry_version[0] != '\0' ?
+                          dependency->registry_version : "<latest>");
+            return -1;
+        }
+        return 0;
+    }
 
     if (node_is_git != dependency_is_git) {
         forge_util_set_error(reason, reason_size,
@@ -1199,6 +1440,101 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 return -1;
             }
             is_native = dir_has_file(root, "Forge.toml");
+        } else if (dependency->registry[0] != '\0') {
+            /* Registry source: Sunn yields a source recipe. Materialization
+             * reuses the ordinary Git checkout primitive for Git recipes and
+             * the ordinary fetch/checksum path for URL recipes. */
+            ForgeLockEntry *locked = lock_find(&context->lock, dependency->name);
+            char cache_home[FORGE_PATH_MAX];
+            char safe_name[FORGE_PATH_MAX];
+            char package_dir[FORGE_PATH_MAX];
+            ForgeCacheGate gate;
+            ForgeRegistryPin pin;
+            int reused = 0;
+            int fetch_status;
+
+            if (forge_home_root(cache_home, sizeof(cache_home)) != 0) {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "cannot resolve '%s': no dependency cache available",
+                          dependency->name);
+                return -1;
+            }
+            forge_paths_safe_output_name(dependency->registry, safe_name,
+                                         sizeof(safe_name));
+            if (snprintf(package_dir, sizeof(package_dir), "%s/registry/%s",
+                         cache_home, safe_name) < 0 ||
+                strlen(cache_home) + 11U + strlen(safe_name) >= sizeof(package_dir)) {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "dependency cache path is too long");
+                return -1;
+            }
+            if (forge_paths_ensure_directory(package_dir, context->error,
+                                              sizeof(context->error)) != 0) {
+                forge_util_prepend_error(context->error, sizeof(context->error),
+                          "cannot resolve '%s': ", dependency->name);
+                return -1;
+            }
+            /* M6 gate, same as git checkouts: one writer per package dir. */
+            if (cache_gate_acquire(context->logger, package_dir, &gate,
+                                   context->error,
+                                   sizeof(context->error)) != 0) {
+                return -1;
+            }
+            fetch_status = forge_registry_materialize(
+                context->logger, dependency->name, dependency->registry,
+                dependency->registry_version,
+                locked != NULL ? locked->version : "",
+                locked != NULL ? locked->kind : "",
+                locked != NULL ? locked->location : "",
+                locked != NULL ? locked->ref : "",
+                locked != NULL ? locked->commit : "",
+                locked != NULL ? locked->sha256 : "",
+                dep_force, context->offline, package_dir,
+                root, sizeof(root), &pin, &reused,
+                context->error, sizeof(context->error));
+            cache_gate_release(&gate);
+            if (fetch_status != 0) {
+                return -1;
+            }
+            deps_log(context->logger, "deps", "resolved %s %s%s",
+                     dependency->name, pin.version,
+                     reused ? " (cached)" : "");
+
+            if (pin.kind[0] == '\0' || pin.location[0] == '\0') {
+                forge_util_set_error(context->error, sizeof(context->error),
+                          "internal error: registry pin for '%s' has no source",
+                          dependency->name);
+                return -1;
+            }
+
+            /* Record/update the pin; a kind change from git silently
+             * converts, exactly like a changed git URL does — the
+             * manifest is the source of truth and --locked catches
+             * anything unintended in CI. */
+            if (locked == NULL) {
+                if (context->lock.count == FORGE_LOCK_MAX_ENTRIES) {
+                    forge_util_set_error(context->error, sizeof(context->error),
+                              "more than %u locked dependencies", FORGE_LOCK_MAX_ENTRIES);
+                    return -1;
+                }
+                locked = &context->lock.items[context->lock.count++];
+                (void)snprintf(locked->name, sizeof(locked->name), "%s", dependency->name);
+            }
+            if (strcmp(locked->kind, pin.kind) != 0 ||
+                strcmp(locked->version, pin.version) != 0 ||
+                strcmp(locked->location, pin.location) != 0 ||
+                strcmp(locked->ref, pin.ref) != 0 ||
+                strcmp(locked->commit, pin.commit) != 0 ||
+                strcmp(locked->sha256, pin.sha256) != 0) {
+                (void)snprintf(locked->kind, sizeof(locked->kind), "%s", pin.kind);
+                (void)snprintf(locked->version, sizeof(locked->version), "%s", pin.version);
+                (void)snprintf(locked->location, sizeof(locked->location), "%s", pin.location);
+                (void)snprintf(locked->ref, sizeof(locked->ref), "%s", pin.ref);
+                (void)snprintf(locked->commit, sizeof(locked->commit), "%s", pin.commit);
+                (void)snprintf(locked->sha256, sizeof(locked->sha256), "%s", pin.sha256);
+                context->lock_dirty = 1;
+            }
+            is_native = dir_has_file(root, "Forge.toml");
         } else {
             ForgeLockEntry *locked = lock_find(&context->lock, dependency->name);
             char cache_home[FORGE_PATH_MAX];
@@ -1242,9 +1578,8 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                      cache_home, "git") != 0 ||
                     forge_paths_ensure_directory(cache_git_root, context->error,
                                                  sizeof(context->error)) != 0) {
-                    forge_util_set_error(context->error, sizeof(context->error),
-                              "cannot resolve '%s': %s", dependency->name,
-                              context->error);
+                    forge_util_prepend_error(context->error, sizeof(context->error),
+                              "cannot resolve '%s': ", dependency->name);
                     return -1;
                 }
             }
@@ -1261,7 +1596,7 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                        sizeof(context->error)) != 0) {
                     return -1;
                 }
-                checkout_status = ensure_git_checkout(
+                checkout_status = forge_deps_ensure_git_checkout(
                     context->logger, dependency->name,
                     dependency->git_url, dependency->ref,
                     locked != NULL &&
@@ -1296,6 +1631,8 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                 (void)snprintf(locked->commit, sizeof(locked->commit), "%s", resolved_sha);
                 (void)snprintf(locked->url, sizeof(locked->url), "%s", dependency->git_url);
                 (void)snprintf(locked->ref, sizeof(locked->ref), "%s", dependency->ref);
+                locked->version[0] = '\0';
+                locked->sha256[0] = '\0';
                 context->lock_dirty = 1;
             }
             (void)snprintf(root, sizeof(root), "%s", cache_dir);
@@ -1317,8 +1654,8 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
                                  "Forge.toml") != 0 ||
                 forge_manifest_load(manifest_path, parsed, context->error,
                                     sizeof(context->error)) != 0) {
-                forge_util_set_error(context->error, sizeof(context->error),
-                          "dependency '%s': %s", dependency->name, context->error);
+                forge_util_prepend_error(context->error, sizeof(context->error),
+                          "dependency '%s': ", dependency->name);
                 free(parsed);
                 return -1;
             }
@@ -1347,7 +1684,14 @@ static int resolve_recursive(ForgeResolveContext *context, const char *consumer_
         node->source_url[0] = '\0';
         node->source_ref[0] = '\0';
         node->source_path[0] = '\0';
-        if (dependency->git_url[0] != '\0') {
+        node->is_registry = 0;
+        if (dependency->registry[0] != '\0') {
+            (void)snprintf(node->source_url, sizeof(node->source_url), "%s",
+                           dependency->registry);
+            (void)snprintf(node->source_ref, sizeof(node->source_ref), "%s",
+                           dependency->registry_version);
+            node->is_registry = 1;
+        } else if (dependency->git_url[0] != '\0') {
             (void)snprintf(node->source_url, sizeof(node->source_url), "%s",
                            dependency->git_url);
             (void)snprintf(node->source_ref, sizeof(node->source_ref), "%s",
@@ -1536,10 +1880,13 @@ static int has_static_lib_suffix(const char *name)
  * Depth-first search of `dir` for the first static library. Returns 1 when
  * one was copied into `found`, 0 when none was found, -1 on a hard error.
  * Generated/build directories that never hold the final artifact are pruned
- * to keep the scan bounded by `budget` entries.
+ * to keep the scan bounded by `budget` entries. Symlinks are never followed:
+ * a dependency containing `build -> /usr/lib` must not resolve its artifact
+ * outside its own root (nor loop forever), so linked entries are skipped and
+ * nesting past FORGE_SCAN_MAX_DEPTH is a hard error.
  */
 static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_size,
-                                   unsigned *budget)
+                                    unsigned *budget, unsigned depth)
 {
 #if FORGE_PLATFORM_WINDOWS
     WIN32_FIND_DATAA entry;
@@ -1552,6 +1899,9 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
 
     if (*budget == 0U) {
         return 0;
+    }
+    if (depth >= FORGE_SCAN_MAX_DEPTH) {
+        return -1;
     }
     --*budget;
 #if FORGE_PLATFORM_WINDOWS
@@ -1573,13 +1923,17 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
             (void)FindClose(handle);
             return -1;
         }
+        if ((entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+            continue;
+        }
         if ((entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) {
             if (strcmp(entry.cFileName, "CMakeFiles") == 0 ||
                 strcmp(entry.cFileName, ".git") == 0 ||
                 strcmp(entry.cFileName, "target") == 0) {
                 continue;
             }
-            status = scan_dir_for_static_lib(child, found, found_size, budget);
+            status = scan_dir_for_static_lib(child, found, found_size, budget,
+                                             depth + 1U);
             if (status != 0) {
                 (void)FindClose(handle);
                 return status;
@@ -1617,7 +1971,10 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
             (void)closedir(stream);
             return -1;
         }
-        if (stat(child, &details) != 0) {
+        if (lstat(child, &details) != 0) {
+            continue;
+        }
+        if (S_ISLNK(details.st_mode)) {
             continue;
         }
         if (S_ISDIR(details.st_mode)) {
@@ -1626,7 +1983,8 @@ static int scan_dir_for_static_lib(const char *dir, char *found, size_t found_si
                 strcmp(item->d_name, "target") == 0) {
                 continue;
             }
-            status = scan_dir_for_static_lib(child, found, found_size, budget);
+            status = scan_dir_for_static_lib(child, found, found_size, budget,
+                                             depth + 1U);
             if (status != 0) {
                 (void)closedir(stream);
                 return status;
@@ -1661,7 +2019,8 @@ static int find_static_artifact(const char *root, char *artifact, size_t artifac
                              search_dirs[index]) != 0) {
             continue;
         }
-        status = scan_dir_for_static_lib(candidate, artifact, artifact_size, &budget);
+        status = scan_dir_for_static_lib(candidate, artifact, artifact_size, &budget,
+                                             0U);
         if (status < 0) {
             forge_util_set_error(error, error_size,
                       "could not search '%s' for a built library", candidate);
@@ -1680,6 +2039,67 @@ static int find_static_artifact(const char *root, char *artifact, size_t artifac
 
 #define FORGE_SCRIPTS_MARKER ".forge-scripts-approved"
 
+/* True only for a genuine regular file: symlinks (and Windows reparse
+ * points) never count, so a dependency cannot smuggle approval past the
+ * prompt with a marker link, nor redirect the approval write at a victim. */
+static int marker_is_approved(const char *path)
+{
+#if FORGE_PLATFORM_WINDOWS
+    DWORD attributes = GetFileAttributesA(path);
+
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U &&
+           (attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0U;
+#else
+    struct stat details;
+
+    return lstat(path, &details) == 0 && S_ISREG(details.st_mode);
+#endif
+}
+
+/* Records approval atomically: O_CREAT|O_EXCL (plus O_NOFOLLOW where the
+ * platform has it) so a concurrently planted link can neither divert the
+ * write nor slip past the check above. Returns 0 when the marker exists
+ * afterwards as a genuine file, -1 otherwise. */
+static int marker_record_approval(const char *path)
+{
+#if FORGE_PLATFORM_WINDOWS
+    int fd = _open(path, _O_WRONLY | _O_CREAT | _O_EXCL,
+                   _S_IREAD | _S_IWRITE);
+#else
+    int flags = O_WRONLY | O_CREAT | O_EXCL;
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#endif
+    int fd = open(path, flags, 0600);
+#endif
+    FILE *file;
+
+    if (fd < 0) {
+        return marker_is_approved(path) ? 0 : -1;
+    }
+#if FORGE_PLATFORM_WINDOWS
+    file = _fdopen(fd, "w");
+#else
+    file = fdopen(fd, "w");
+#endif
+    if (file == NULL) {
+#if FORGE_PLATFORM_WINDOWS
+        _close(fd);
+#else
+        (void)close(fd);
+#endif
+        (void)remove(path);
+        return -1;
+    }
+    (void)fputs("approved\n", file);
+    if (fclose(file) != 0) {
+        (void)remove(path);
+        return -1;
+    }
+    return 0;
+}
+
 /*
  * Building a foreign dependency runs its cmake/make scripts — third-party
  * code execution on every build. Gate the first run behind an explicit
@@ -1692,12 +2112,11 @@ static int find_static_artifact(const char *root, char *artifact, size_t artifac
  *                                      clone so a fresh clone re-asks.
  */
 static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_name,
-                                 const char *dependency_root, const char *kind,
-                                 char *error, size_t error_size)
+                                  const char *dependency_root, const char *kind,
+                                  char *error, size_t error_size)
 {
     const char *override = getenv("FORGE_ALLOW_DEP_BUILD_SCRIPTS");
     char marker_path[FORGE_PATH_MAX];
-    FILE *answer_file;
 
     if (override != NULL && override[0] != '\0') {
         if (strcmp(override, "0") == 0) {
@@ -1714,7 +2133,7 @@ static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_nam
         forge_util_set_error(error, error_size, "dependency path is too long");
         return -1;
     }
-    if (file_exists(marker_path)) {
+    if (marker_is_approved(marker_path)) {
         return 0;
     }
 #if FORGE_PLATFORM_WINDOWS
@@ -1747,12 +2166,10 @@ static int build_scripts_allowed(ForgeLogger *logger, const char *dependency_nam
             return -1;
         }
     }
-    /* Record the decision so later builds of this checkout stay quiet. */
-    answer_file = fopen(marker_path, "w");
-    if (answer_file != NULL) {
-        (void)fputs("approved\n", answer_file);
-        (void)fclose(answer_file);
-    } else {
+    /* Record the decision so later builds of this checkout stay quiet. A
+     * pre-existing genuine marker (won race) is approval too; anything else
+     * keeps the prompt for next time. */
+    if (marker_record_approval(marker_path) != 0) {
         deps_log(logger, "deps",
                  "could not record script approval for '%s'; it will be "
                  "requested again", dependency_name);

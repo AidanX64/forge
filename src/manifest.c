@@ -448,6 +448,7 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     ForgeInlineEntry entries[FORGE_INLINE_MAX_ENTRIES];
     ForgeDependency *dependency;
     const ForgeInlineEntry *entry;
+    const ForgeInlineEntry *git_entry;
     size_t count = 0U;
     size_t index;
 
@@ -475,14 +476,47 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     }
     if (count == 0U) {
         forge_util_set_error(error, error_size,
-                  "dependency '%s' needs a 'path' or 'git' source", name);
+                  "dependency '%s' needs a 'path', 'git', or 'registry' source", name);
         return -1;
     }
     entry = find_inline_entry(entries, count, "path");
-    if (entry != NULL && find_inline_entry(entries, count, "git") != NULL) {
-        forge_util_set_error(error, error_size,
-                  "dependency '%s' cannot have both 'path' and 'git'", name);
-        return -1;
+    git_entry = find_inline_entry(entries, count, "git");
+    {
+        const ForgeInlineEntry *registry_entry =
+            find_inline_entry(entries, count, "registry");
+        const ForgeInlineEntry *version_entry =
+            find_inline_entry(entries, count, "version");
+        int source_count = (entry != NULL) + (git_entry != NULL) +
+                           (registry_entry != NULL);
+
+        if (source_count != 1) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s' needs exactly one source: 'path', "
+                      "'git', or 'registry'", name);
+            return -1;
+        }
+        if (version_entry != NULL && registry_entry == NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': version only applies to registry "
+                      "dependencies", name);
+            return -1;
+        }
+        if (registry_entry != NULL) {
+            if (find_inline_entry(entries, count, "tag") != NULL ||
+                find_inline_entry(entries, count, "branch") != NULL ||
+                find_inline_entry(entries, count, "rev") != NULL) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': refs only apply to git dependencies",
+                          name);
+                return -1;
+            }
+            if (find_inline_entry(entries, count, "submodules") != NULL) {
+                forge_util_set_error(error, error_size,
+                          "dependency '%s': submodules only apply to git "
+                          "dependencies", name);
+                return -1;
+            }
+        }
     }
     if (find_inline_entry(entries, count, "submodules") != NULL && entry != NULL) {
         forge_util_set_error(error, error_size,
@@ -500,6 +534,8 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
     dependency->git_url[0] = '\0';
     dependency->ref[0] = '\0';
     dependency->path[0] = '\0';
+    dependency->registry[0] = '\0';
+    dependency->registry_version[0] = '\0';
     if (entry != NULL) {
         if (find_inline_entry(entries, count, "tag") != NULL ||
             find_inline_entry(entries, count, "branch") != NULL ||
@@ -508,14 +544,20 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
                       "dependency '%s': refs only apply to git dependencies", name);
             return -1;
         }
+        if (find_inline_entry(entries, count, "version") != NULL) {
+            forge_util_set_error(error, error_size,
+                      "dependency '%s': version only applies to registry "
+                      "dependencies", name);
+            return -1;
+        }
         (void)snprintf(dependency->path, sizeof(dependency->path), "%s", entry->value);
-    } else {
+    } else if (git_entry != NULL) {
         static const char *const ref_keys[] = { "tag", "branch", "rev" };
         const ForgeInlineEntry *submodules_entry;
         size_t key_index;
 
         (void)snprintf(dependency->git_url, sizeof(dependency->git_url), "%s",
-                       find_inline_entry(entries, count, "git")->value);
+                       git_entry->value);
         submodules_entry = find_inline_entry(entries, count, "submodules");
         if (submodules_entry != NULL) {
             char flag_value[FORGE_MANIFEST_VALUE_MAX];
@@ -544,16 +586,31 @@ static int parse_dependency_assignment(ForgeDependencyList *list, const char *na
             }
             (void)snprintf(dependency->ref, sizeof(dependency->ref), "%s", entry->value);
         }
+    } else {
+        /* The source-count check above guarantees a registry entry here. */
+        const ForgeInlineEntry *registry_entry =
+            find_inline_entry(entries, count, "registry");
+        const ForgeInlineEntry *version_entry =
+            find_inline_entry(entries, count, "version");
+
+        (void)snprintf(dependency->registry, sizeof(dependency->registry),
+                       "%s", registry_entry->value);
+        if (version_entry != NULL) {
+            (void)snprintf(dependency->registry_version,
+                           sizeof(dependency->registry_version), "%s",
+                           version_entry->value);
+        }
     }
     /* Reject unknown keys so typos fail loudly. */
     for (index = 0U; index < count; ++index) {
         static const char *const allowed[] = {
-            "path", "git", "tag", "branch", "rev", "submodules"
+            "path", "git", "tag", "branch", "rev", "submodules",
+            "registry", "version"
         };
         size_t allowed_index;
         int known = 0;
 
-        for (allowed_index = 0U; allowed_index < 6U; ++allowed_index) {
+        for (allowed_index = 0U; allowed_index < 8U; ++allowed_index) {
             if (strcmp(entries[index].key, allowed[allowed_index]) == 0) {
                 known = 1;
                 break;

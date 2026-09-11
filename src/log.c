@@ -330,23 +330,26 @@ static void write_classified(ForgeLogger *logger, const char *stage,
                                   ? FORGE_VERBOSITY_VERY_VERBOSE
                                   : FORGE_VERBOSITY_VERBOSE;
 
+    /*
+     * Copy before the first consumption: a va_list becomes indeterminate once
+     * vfprintf has walked it (C11 7.16), so the file branch uses its own copy
+     * and `arguments` stays intact for the terminal echo below.
+     */
+    va_list file_arguments;
+
+    va_copy(file_arguments, arguments);
     if (logger != NULL && logger->file != NULL) {
         (void)fprintf(logger->file, "[INFO] [%s] ", stage);
-        (void)vfprintf(logger->file, format, arguments);
+        (void)vfprintf(logger->file, format, file_arguments);
         fputc('\n', logger->file);
         (void)fflush(logger->file);
     }
+    va_end(file_arguments);
     if (active_verbosity >= required) {
-        /* The file branch above consumed the va_list, so the terminal echo
-         * needs its own copy before walking the arguments again. */
-        va_list copy;
-
-        va_copy(copy, arguments);
         (void)fprintf(stdout, "[INFO] [%s] ", stage);
-        (void)vfprintf(stdout, format, copy);
+        (void)vfprintf(stdout, format, arguments);
         fputc('\n', stdout);
         (void)fflush(stdout);
-        va_end(copy);
     }
 }
 

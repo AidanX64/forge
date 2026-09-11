@@ -12,6 +12,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,6 +143,9 @@ static int text_builder_add(ForgeTextBuilder *builder, const char *line)
         char *grown;
 
         while (builder->length + line_length + 1U > new_capacity) {
+            if (new_capacity > SIZE_MAX / 2U) {
+                return -1;
+            }
             new_capacity *= 2U;
         }
         grown = realloc(builder->text, new_capacity);
@@ -841,20 +845,85 @@ static void report_finished(const ForgeManifest *manifest, int release,
                      forge_log_monotonic_seconds() - started);
 }
 
+static int directory_exists(const char *path)
+{
+    struct stat details;
+
+    return stat(path, &details) == 0 && S_ISDIR(details.st_mode);
+}
+
+/*
+ * Collects the include directories of the [dependencies] `manifest` declares,
+ * resolved against the caller's already-resolved graph. The graph is stored
+ * post-order (a dependency always precedes its consumers), so by the time a
+ * consumer is handed here every node its manifest names exists. This is what
+ * lets dependency sub-builds see their own dependencies' headers without
+ * re-running resolution themselves.
+ */
+static int collect_dep_include_dirs(const ForgeDepGraph *graph,
+                                    const ForgeManifest *manifest,
+                                    ForgeStringList *output,
+                                    char *error, size_t error_size)
+{
+    size_t index;
+
+    memset(output, 0, sizeof(*output));
+    for (index = 0U; index < manifest->dependencies.count; ++index) {
+        const char *name = manifest->dependencies.items[index].name;
+        const ForgeDepNode *node = NULL;
+        char candidate[FORGE_PATH_MAX];
+        const char *chosen;
+        size_t node_index;
+
+        for (node_index = 0U; node_index < graph->count; ++node_index) {
+            if (strcmp(graph->nodes[node_index].name, name) == 0) {
+                node = &graph->nodes[node_index];
+                break;
+            }
+        }
+        if (node == NULL) {
+            /* Unresolvable names fail loudly during resolution itself. */
+            continue;
+        }
+        if (output->count == FORGE_MANIFEST_MAX_ITEMS) {
+            forge_util_set_error(error, error_size, "too many include directories");
+            return -1;
+        }
+        if (forge_paths_join(candidate, sizeof(candidate), node->root,
+                             "include") != 0) {
+            forge_util_set_error(error, error_size, "include path is too long");
+            return -1;
+        }
+        chosen = directory_exists(candidate) ? candidate : node->root;
+        if (strlen(chosen) >= sizeof(output->items[output->count])) {
+            forge_util_set_error(error, error_size,
+                      "include path '%s' is too long", chosen);
+            return -1;
+        }
+        memcpy(output->items[output->count], chosen, strlen(chosen) + 1U);
+        ++output->count;
+    }
+    return 0;
+}
+
 /*
  * The shared build pipeline behind every compile/link/run style command.
  * `sources_override` (a shallow list, never owned) replaces manifest source
  * discovery so the test runner can build one binary per test file, and
  * `output_name_override` replaces the sanitized project name as the
- * executable base name. When `resolve_dependencies` is set, [dependencies]
- * are resolved and built first and their headers/objects feed this build;
- * dependency builds recurse with the flag cleared (and without a manifest
- * path, since dep objects carry their own freshness through mtimes).
+ * executable base name. `forced_extra_includes` (never owned) supplies the
+ * -I directories for a sub-build whose [dependencies] were resolved by the
+ * caller's graph instead of being resolvable from here. When
+ * `resolve_dependencies` is set, [dependencies] are resolved and built first
+ * and their headers/objects feed this build; dependency builds recurse with
+ * the flag cleared (and without a manifest path, since dep objects carry
+ * their own freshness through mtimes).
  */
 static int build_binary_inner(const char *project_root, const ForgeManifest *manifest,
                               const char *manifest_path_for_freshness,
                               ForgeBuildMode mode, const ForgeBuildOptions *options,
                               const ForgeSourceList *sources_override,
+                              const ForgeStringList *forced_extra_includes,
                               const char *output_name_override,
                               const char *const *program_arguments,
                               size_t program_argument_count,
@@ -964,11 +1033,28 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                 version_suffix(node->manifest, suffix, sizeof(suffix));
                 forge_log_status("Compiling", "%s%s", node->name, suffix);
                 if (node->is_native) {
+                    /*
+                     * The sub-build cannot resolve its own [dependencies]
+                     * (recursion clears the flag), so hand it the include
+                     * directories its dependencies resolved to here.
+                     */
+                    ForgeStringList node_includes;
+                    const ForgeStringList *forced_includes = NULL;
+
+                    if (node->manifest->dependencies.count != 0U) {
+                        if (collect_dep_include_dirs(&dep_graph, node->manifest,
+                                                     &node_includes, error,
+                                                     sizeof(error)) != 0) {
+                            print_error("%s", error);
+                            goto cleanup;
+                        }
+                        forced_includes = &node_includes;
+                    }
                     if (build_binary_inner(node->root, node->manifest,
                                            NULL,
                                            FORGE_BUILD_MODE_DEP_OBJECTS, options,
-                                           NULL, NULL, NULL, 0U,
-                                           node->link_artifact,
+                                           NULL, forced_includes, NULL, NULL,
+                                           0U, node->link_artifact,
                                            sizeof(node->link_artifact),
                                            NULL, 0) != 0) {
                         print_error("dependency '%s' failed to build", node->name);
@@ -1056,7 +1142,9 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
     context.compiler = &compiler;
     context.profile = profile;
     context.sources = &sources;
-    context.extra_include_dirs = have_deps ? &dep_includes : NULL;
+    context.extra_include_dirs = forced_extra_includes != NULL
+                                     ? forced_extra_includes
+                                     : (have_deps ? &dep_includes : NULL);
     context.project_version = manifest->project_version;
     context.object_paths = object_paths;
     context.object_references = object_references;
@@ -1160,6 +1248,24 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
             break;
         }
     }
+    /*
+     * Dependency objects join this project's link line too, so a native
+     * dependency that compiles C++ must flip the link driver as well — a
+     * plain gcc/clang link would drop the C++ runtime and fail on std::
+     * symbols. Foreign (CMake/Make) artifacts may need it too, but their
+     * languages are unknowable here; raw cflags remain the escape hatch.
+     */
+    if (!has_cpp_source && have_deps) {
+        for (node_index = 0U; node_index < dep_graph.count; ++node_index) {
+            const ForgeDepNode *node = &dep_graph.nodes[node_index];
+
+            if (node->manifest != NULL &&
+                node->manifest->cpp_source_dirs.count > 0U) {
+                has_cpp_source = 1;
+                break;
+            }
+        }
+    }
     forge_logger_detail(active_logger, "compile",
                         "compiled %zu, up-to-date %zu", context.compiled, context.skipped);
 
@@ -1243,6 +1349,7 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                                 (const char *const *)dep_link_inputs.items,
                                 dep_link_inputs.count) != 0) {
             print_error("out of memory while recording link inputs");
+            text_builder_free(&expected_stamp);
             goto cleanup;
         }
         fresh = link_is_fresh(executable_path, stamp_path, &expected_stamp,
@@ -1271,10 +1378,11 @@ static int build_binary_inner(const char *project_root, const ForgeManifest *man
                                           sources.count,
                                           (const char *const *)dep_link_inputs.items,
                                           dep_link_inputs.count, executable_path,
-                                          profile_directory, profile, &argv,
-                                          &used_response_file, error,
-                                          sizeof(error)) != 0) {
+                                           profile_directory, profile, &argv,
+                                           &used_response_file, error,
+                                           sizeof(error)) != 0) {
             print_error("%s", error);
+            text_builder_free(&expected_stamp);
             goto cleanup;
         }
         forge_logger_detail(active_logger, "link", "----- link %s -----", executable_path);
@@ -1361,6 +1469,11 @@ cleanup:
         }
     }
     free(context.commands);
+    if (context.command_displays != NULL) {
+        for (source_index = 0U; source_index < context.count; ++source_index) {
+            free(context.command_displays[source_index]);
+        }
+    }
     free(context.command_displays);
     free(context.command_hashes);
     free(object_references);
@@ -1394,7 +1507,7 @@ int forge_build_project(const char *project_root, const ForgeManifest *manifest,
                         int *child_exit_code)
 {
     return build_binary_inner(project_root, manifest, manifest_path, mode, options,
-                              NULL, NULL, program_arguments,
+                              NULL, NULL, NULL, program_arguments,
                               program_argument_count, built_executable,
                               built_executable_size, child_exit_code, 1);
 }
@@ -1502,7 +1615,7 @@ int forge_build_tests(const char *project_root, const ForgeManifest *manifest,
                             name, tests.items[index].path);
         status = build_binary_inner(project_root, manifest, manifest_path,
                                     FORGE_BUILD_MODE_RUN, options,
-                                    &single, name, NULL, 0U, NULL, 0U,
+                                    &single, NULL, name, NULL, 0U, NULL, 0U,
                                     &child_exit_code, 1);
         if (status != 0) {
             ++failed;

@@ -184,10 +184,16 @@ int forge_orchestrate_update(const char *manifest_path, const char *only_name,
             return 1;
         }
         if (resolve_name == NULL) {
-            /* Path deps are used in place and have nothing to re-resolve;
-             * say so instead of silently pretending an update happened. */
+            /*
+             * Path deps are used in place and have nothing to re-resolve.
+             * Return instead of falling through: with a NULL name the shared
+             * resolver treats this as a bare update and forces every git pin,
+             * which is exactly what naming one dependency must never do.
+             */
             forge_logger_log(&logger, "update",
                              "'%s' is a path dependency; nothing to update", only_name);
+            finish_invocation(&logger);
+            return 0;
         }
     }
     /*
@@ -247,7 +253,9 @@ int forge_orchestrate_clean(const char *manifest_path)
 
 int forge_orchestrate_add(const char *manifest_path, const char *name,
                           const char *git_url, const char *ref_kind,
-                          const char *ref_value, const char *dep_path)
+                          const char *ref_value, const char *dep_path,
+                          const char *registry_package,
+                          const char *registry_version)
 {
     ForgeLogger logger = {0};
     char error[FORGE_COMMAND_MAX] = {0};
@@ -264,6 +272,7 @@ int forge_orchestrate_add(const char *manifest_path, const char *name,
     forge_build_set_logger(&logger);
     forge_log_set_session_logger(&logger);
     if (forge_pkg_add(manifest_path, name, git_url, ref_kind, ref_value, dep_path,
+                      registry_package, registry_version,
                       &logger, error, sizeof(error)) != 0) {
         forge_logger_error(&logger, "deps", "%s", error);
         result = 1;
